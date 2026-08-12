@@ -27,7 +27,7 @@ class Host:
     cpu_count: int | None
 
     def __str__(self) -> str:
-        return f"{self.hostname} ({self.kernel}, {self.cpu_count} cpus)"
+        return f'{self.hostname} ({self.kernel}, {self.cpu_count} cpus)'
 
 
 class Server:
@@ -40,6 +40,8 @@ class Server:
     `~/.tether/servers.toml`, then `~/.ssh/config` (handled by asyncssh). A
     `name` that is absent from the config file is treated as a hostname or
     `ssh_config` alias, so `Server("terra")` works with no tether config at all.
+    Pass `ssh_config=` to read a specific ssh_config file rather than
+    `~/.ssh/config`, exactly like `ssh -F`.
 
     Each instance owns exactly one connection and one event loop; there is no
     shared registry and no module-level state. Construct one and pass it around
@@ -55,6 +57,7 @@ class Server:
         port: int | None = None,
         workdir: str | None = None,
         environment: str | None = None,
+        ssh_config: str | Path | None = None,
         config_dir: str | Path | None = None,
         keepalive: int = DEFAULT_KEEPALIVE,
         connect_timeout: float = 30.0,
@@ -65,10 +68,10 @@ class Server:
         self.label = name
         self.host = host or (cfg.host if cfg else name)
         if not self.host:
-            raise ConfigError("a server needs a name or an explicit host")
+            raise ConfigError('a server needs a name or an explicit host')
 
         self.user = user or (cfg.user if cfg else None)
-        self.workdir = workdir or (cfg.workdir if cfg else "~/.tether")
+        self.workdir = workdir or (cfg.workdir if cfg else '~/.tether')
 
         wanted = environment or (cfg.default_environment if cfg else None)
         if wanted and wanted not in config.environments:
@@ -82,6 +85,7 @@ class Server:
             self.host,
             self.user,
             port=port,
+            ssh_config=ssh_config,
             keepalive=keepalive,
             connect_timeout=connect_timeout,
         )
@@ -109,8 +113,8 @@ class Server:
         self.close()
 
     def __repr__(self) -> str:
-        who = f"{self.user}@{self.host}" if self.user else self.host
-        return f"<{type(self).__name__} {who}>"
+        who = f'{self.user}@{self.host}' if self.user else self.host
+        return f'<{type(self).__name__} {who}>'
 
     def run(
         self,
@@ -135,7 +139,7 @@ class Server:
     def info(self) -> Host:
         """Basic facts about the remote machine, in one round trip."""
         result = self.run('printf "%s|%s|%s\\n" "$(uname -n)" "$(uname -r)" "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"', check=True)
-        parts = (result.stdout.strip().split("|") + ["", "", ""])[:3]
+        parts = (result.stdout.strip().split('|') + ['', '', ''])[:3]
         hostname, kernel, cpus = (p.strip() for p in parts)
         return Host(hostname=hostname, kernel=kernel, cpu_count=_slurm._int(cpus))
 
@@ -146,7 +150,7 @@ class Server:
         supplies it.
         """
         if self._username is None:
-            self._username = self.run("id -un", check=True).stdout.strip()
+            self._username = self.run('id -un', check=True).stdout.strip()
         return self._username
 
 
@@ -163,13 +167,13 @@ class SlurmServer(Server):
     def connect(self) -> Self:
         super().connect()
         if self._slurm_version is None:
-            result = self.run("sinfo --version", timeout=30)
+            result = self.run('sinfo --version', timeout=30)
             if not result.ok:
                 self.close()
+                stderr = result.stderr.strip() or 'no output'
                 raise SlurmError(
-                    f"no usable Slurm on {self.host}: "
-                    f"`sinfo --version` exited {result.returncode} "
-                    f"({result.stderr.strip() or 'no output'})"
+                    f'no usable Slurm on {self.host}: '
+                    f'`sinfo --version` exited {result.returncode} ({stderr})'
                 )
             self._slurm_version = result.stdout.strip()
         return self
@@ -179,7 +183,7 @@ class SlurmServer(Server):
         """e.g. 'slurm 23.02.7'. Triggers a connection if not yet known."""
         self.connect()
         if self._slurm_version is None:
-            raise SlurmError(f"Slurm version unavailable on {self.host}")
+            raise SlurmError(f'Slurm version unavailable on {self.host}')
         return self._slurm_version
 
     def partitions(self) -> list[Partition]:
@@ -190,7 +194,7 @@ class SlurmServer(Server):
         """
         self.connect()
         fmt = shlex.quote(_slurm.spec_format(_slurm.SINFO_SPEC))
-        return _slurm.parse_sinfo(self.run(f"sinfo -h -s -o {fmt}", check=True).stdout)
+        return _slurm.parse_sinfo(self.run(f'sinfo -h -s -o {fmt}', check=True).stdout)
 
     def queue(self, user: str | None = None) -> list[Job]:
         """Jobs in the queue.
@@ -203,10 +207,9 @@ class SlurmServer(Server):
         """
         self.connect()
         fmt = shlex.quote(_slurm.spec_format(_slurm.SQUEUE_SPEC))
-        command = f"squeue -h -a -o {fmt}"
+        command = f'squeue -h -a -o {fmt}'
         if user:
-            command += f" -u {shlex.quote(user)}"
-        self.connect()
+            command += f' -u {shlex.quote(user)}'
         return _slurm.parse_squeue(self.run(command, check=True).stdout)
 
     def job(self, jobid: str | int) -> Job | None:
@@ -219,16 +222,14 @@ class SlurmServer(Server):
         """
         self.connect()
         fmt = shlex.quote(_slurm.spec_format(_slurm.SQUEUE_SPEC))
-        result = self.run(
-            f"squeue -h -a -o {fmt} --job={shlex.quote(str(jobid))}"
-        )
+        command = f'squeue -h -a -o {fmt} --job={shlex.quote(str(jobid))}'
         result = self.run(command)
 
         if not result.ok:
-            if "invalid job id" in result.stderr.lower():
+            if 'invalid job id' in result.stderr.lower():
                 return None
             raise SlurmError(
-                f"squeue failed for job {jobid}: {result.stderr.strip()}"
+                f'squeue failed for job {jobid}: {result.stderr.strip()}'
             )
 
         jobs = _slurm.parse_squeue(result.stdout)
@@ -250,11 +251,11 @@ def server(name: str | None = None, *, kind: ServerKind | str | None = None, **k
 
     if kind is None:
         # No explicit kind: try the config file, then fall back to Slurm.
-        config_dir = kwargs.get("config_dir")
+        config_dir = kwargs.get('config_dir')
         if not isinstance(config_dir, (str, Path, type(None))):
             raise ConfigError(
-                f"config_dir must be a str, Path or None, "
-                f"not {type(config_dir).__name__}"
+                f'config_dir must be a str, Path or None, '
+                f'not {type(config_dir).__name__}'
             )
         cfg = load_config(config_dir).server(name) if name else None
         kind = cfg.kind if cfg else ServerKind.SLURM
@@ -264,7 +265,7 @@ def server(name: str | None = None, *, kind: ServerKind | str | None = None, **k
     except ValueError:
         raise ConfigError(
             f'unknown server kind "{kind}"; '
-            f"expected one of {[k.value for k in ServerKind]}"
+            f'expected one of {[k.value for k in ServerKind]}'
         ) from None
 
     return server_dict[kind](name, **kwargs)  # type: ignore[arg-type]

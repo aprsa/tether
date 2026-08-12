@@ -29,7 +29,7 @@ from .server import Host, Server, SlurmServer, server
 from .slurm import Job, Partition, parse_duration
 from .link import Result, Link
 
-__version__ = "0.1.0"
+__version__ = '0.1.0'
 
 __all__ = [
     'Config',

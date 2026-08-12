@@ -7,7 +7,7 @@ name = "tether"
 version = "0.1.0"
 description = "Task Execution and Transfer Handler for External Resources"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
 authors = [{ name = "Andrej Prsa" }]
 keywords = ["ssh", "slurm", "hpc", "remote-execution"]
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: System :: Distributed Computing",
 ]
 
@@ -30,3 +30,15 @@ include = ["tether*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff.lint]
+extend-select = ["Q"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "double"
+docstring-quotes = "double"
+
+[tool.ruff.format]
+quote-style = "single"
+docstring-code-format = false

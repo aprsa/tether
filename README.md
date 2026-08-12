@@ -7,8 +7,7 @@ connection. No remote listener, no callback channel, no agent to install on the
 cluster. Intended to replace `crimpl` as PHOEBE's route to a Slurm HPC, while
 staying independent of PHOEBE.
 
-Requires Python 3.11+. Runtime dependency: `asyncssh`. That's all — TOML parsing
-is stdlib.
+Requires Python 3.12+. Runtime dependency: `asyncssh`.
 
 ## Design axiom
 
@@ -54,6 +53,10 @@ with tether.server("terra") as terra:
 No config file is needed — `Server("terra")` falls through to `~/.ssh/config`,
 which asyncssh reads natively (`Hostname`, `User`, `Port`, `IdentityFile`,
 `ProxyJump`, `ProxyCommand`, `Match`, `Include` all honoured). Let ssh own SSH.
+
+Pass `ssh_config="/path/to/config"` to read a specific file instead, akin
+to `ssh -F`. The test rig uses it to describe a throwaway server without
+touching `~/.ssh`.
 
 ## Configuration
 
@@ -157,10 +160,20 @@ are indistinguishable until `sacct` and sentinels land.
 ## Tests
 
 ```bash
-python -m pytest tests/test_units.py   # parsers and config; no cluster needed
-python -m pytest tests/test_live.py    # needs an sshd + Slurm shims on :2222
+bash tests/rig.sh start     # local fake cluster: sshd + Slurm shims on :2222
+python -m pytest tests/
+bash tests/rig.sh stop
 ```
 
-`test_live.py` skips itself when nothing is listening. It covers authentication,
-channel reuse, timeout-with-terminate, reconnect after a dropped link, and SFTP
-round trips — see `tests/rig.sh` for the local fake cluster.
+`tests/rig.sh` needs **no root** and writes nothing outside `/tmp/tether-rig`.
+It generates its own host key, client key, `authorized_keys`
+and `ssh_config`; the live tests connect to the alias `tether-rig` through that
+file, which also exercises the ssh_config fall-through. `sshd` needs no
+privileges here because the only account it ever authenticates is the one
+running it.
+
+`tests/test_units.py` (parsers, config) needs nothing. `tests/test_live.py`
+covers authentication, channel reuse, timeout-with-terminate, reconnect after a
+dropped link, and SFTP round trips, and skips itself when the rig is down.
+Layer 3 has no other coverage, so set `TETHER_REQUIRE_LIVE=1` in CI to turn that
+skip into a hard error.

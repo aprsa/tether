@@ -61,7 +61,7 @@ class EnvironmentConfig:
     modules: tuple[str, ...] = ()
     prelude: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
-    mpirun: str = "mpirun"
+    mpirun: str = 'mpirun'
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,7 @@ class ServerConfig:
     kind: ServerKind | str = ServerKind.SLURM
     host: str | None = None
     user: str | None = None
-    workdir: str = "~/.tether"
+    workdir: str = '~/.tether'
     default_environment: str | None = None
 
 
@@ -85,32 +85,32 @@ class Config:
         return self.servers.get(label)
 
 
-def config_path(config_dir: Path | str | None = None) -> Path:
+def config_path(config_dir: str | Path | None = None) -> Path:
     base = Path(config_dir).expanduser() if config_dir else DEFAULT_CONFIG_DIR
     return base / CONFIG_FILENAME
 
 
-def load_config(config_dir: Path | str | None = None) -> Config:
+def load_config(config_dir: str | Path | None = None) -> Config:
     """Read the config file. Note that config_dir can be None."""
     path = config_path(config_dir)
     if not path.exists():
         return Config()
 
     try:
-        with path.open("rb") as fh:
+        with path.open('rb') as fh:
             raw = tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"{path}: {exc}") from exc
+        raise ConfigError(f'{path}: {exc}') from exc
     except OSError as exc:
-        raise ConfigError(f"cannot read {path}: {exc}") from exc
+        raise ConfigError(f'cannot read {path}: {exc}') from exc
 
     servers = {
         label: _server(path, label, body)
-        for label, body in _table(path, raw, "server").items()
+        for label, body in _table(path, raw, 'server').items()
     }
     environments = {
         label: _environment(path, label, body)
-        for label, body in _table(path, raw, "environment").items()
+        for label, body in _table(path, raw, 'environment').items()
     }
 
     for cfg in servers.values():
@@ -127,41 +127,46 @@ def load_config(config_dir: Path | str | None = None) -> Config:
 def _table(path: Path, raw: dict, key: str) -> dict:
     body = raw.get(key, {})
     if not isinstance(body, dict):
-        raise ConfigError(f"{path}: [{key}] must be a table")
+        raise ConfigError(f'{path}: [{key}] must be a table')
     return body
 
 
 def _server(path: Path, label: str, body: dict) -> ServerConfig:
-    where = f"{path}: [server.{label}]"
-    _reject_unknown(where, body, ServerConfig, skip={"label"})
+    where = f'{path}: [server.{label}]'
+    _reject_unknown(where, body, ServerConfig, skip={'label'})
 
     kind = body.get('kind', ServerKind.SLURM)
     if kind not in ServerKind:
-        raise ConfigError(f"{where}: kind must be one of [{[kind.value for kind in ServerKind]}]")
+        raise ConfigError(
+            f'{where}: kind must be one of {[k.value for k in ServerKind]}, not {kind!r}'
+        )
 
     return ServerConfig(
         label=label,
         kind=kind,
-        host=body.get("host", label),
-        user=body.get("user"),
-        workdir=body.get("workdir", "~/.tether"),
-        default_environment=body.get("default_environment"),
+        host=body.get('host', label),
+        user=body.get('user'),
+        workdir=body.get('workdir', '~/.tether'),
+        default_environment=body.get('default_environment'),
     )
 
 
 def _environment(path: Path, label: str, body: dict) -> EnvironmentConfig:
-    where = f"{path}: [environment.{label}]"
-    _reject_unknown(where, body, EnvironmentConfig, skip={"label"})
+    where = f'{path}: [environment.{label}]'
+    _reject_unknown(where, body, EnvironmentConfig, skip={'label'})
 
     kind = body.get('kind', EnvironmentKind.NONE)
     if kind not in EnvironmentKind:
-        raise ConfigError(f"{where}: kind must be one of {[kind.value for kind in EnvironmentKind]}")
+        raise ConfigError(
+            f'{where}: kind must be one of {[k.value for k in EnvironmentKind]}, '
+            f'not {kind!r}'
+        )
 
-    name = body.get("name")
-    if kind in ("conda", "venv") and not name:
+    name = body.get('name')
+    if kind in (EnvironmentKind.CONDA, EnvironmentKind.VENV) and not name:
         raise ConfigError(f"{where}: kind '{kind}' requires 'name'")
 
-    env = body.get("env", {})
+    env = body.get('env', {})
     if not isinstance(env, dict):
         raise ConfigError(f"{where}: 'env' must be a table of strings")
 
@@ -169,10 +174,10 @@ def _environment(path: Path, label: str, body: dict) -> EnvironmentConfig:
         label=label,
         kind=kind,
         name=name,
-        modules=tuple(body.get("modules", ())),
-        prelude=tuple(body.get("prelude", ())),
+        modules=tuple(body.get('modules', ())),
+        prelude=tuple(body.get('prelude', ())),
         env={str(k): str(v) for k, v in env.items()},
-        mpirun=body.get("mpirun", "mpirun"),
+        mpirun=body.get('mpirun', 'mpirun'),
     )
 
 
@@ -182,6 +187,6 @@ def _reject_unknown(where: str, body: dict, cls: type, skip: set[str]) -> None:
     unknown = set(body) - known
     if unknown:
         raise ConfigError(
-            f"{where}: unknown key(s) {sorted(unknown)}; "
-            f"expected any of {sorted(known)}"
+            f'{where}: unknown key(s) {sorted(unknown)}; '
+            f'expected any of {sorted(known)}'
         )

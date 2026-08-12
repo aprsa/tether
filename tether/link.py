@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine
+from pathlib import Path
+from typing import Any, Self
 
 import asyncssh
 
@@ -65,7 +67,7 @@ class Result:
     def ok(self) -> bool:
         return self.returncode == 0
 
-    def check(self) -> "Result":
+    def check(self) -> Self:
         """Raise `RemoteCommandError` unless the command succeeded."""
         if not self.ok:
             raise RemoteCommandError(self)
@@ -81,6 +83,12 @@ class Link:
 
     Connects lazily on first use. Not thread-safe and not usable from inside a
     running event loop: it owns its own loop and drives it synchronously.
+
+    `ssh_config` names an ssh_config file to read *instead of* `~/.ssh/config`,
+    exactly like `ssh -F`. It is not a security relaxation: host keys are still
+    validated strictly, against whatever `UserKnownHostsFile` that config
+    names. It exists so a caller can be hermetic -- the test rig uses it to
+    describe a throwaway server without touching the user's `~/.ssh`.
     """
 
     def __init__(
@@ -89,12 +97,14 @@ class Link:
         user: str | None = None,
         *,
         port: int | None = None,
+        ssh_config: str | Path | None = None,
         keepalive: int = DEFAULT_KEEPALIVE,
         connect_timeout: float = 30.0,
     ) -> None:
         self.host = host
         self.user = user
         self.port = port
+        self.ssh_config = ssh_config
         self.keepalive = keepalive
         self.connect_timeout = connect_timeout
 
@@ -106,7 +116,7 @@ class Link:
     def connected(self) -> bool:
         return self._conn is not None
 
-    def connect(self) -> "Link":
+    def connect(self) -> Self:
         """Establish the connection now instead of on first use."""
         self._call(self._noop)
         return self
@@ -134,16 +144,16 @@ class Link:
             self._loop.close()
         self._loop = None
 
-    def __enter__(self) -> "Link":
+    def __enter__(self) -> Self:
         return self.connect()
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
     def __repr__(self) -> str:
-        target = f"{self.user}@{self.host}" if self.user else self.host
-        state = "connected" if self.connected else "disconnected"
-        return f"<Link {target} ({state})>"
+        target = f'{self.user}@{self.host}' if self.user else self.host
+        state = 'connected' if self.connected else 'disconnected'
+        return f'<Link {target} ({state})>'
 
     def run(
         self,
@@ -186,7 +196,7 @@ class Link:
     def ping(self) -> float:
         """Round-trip time in seconds for a trivial remote command."""
         start = time.perf_counter()
-        self.run("true", check=True, timeout=DEFAULT_TIMEOUT)
+        self.run('true', check=True, timeout=DEFAULT_TIMEOUT)
         return time.perf_counter() - start
 
     async def _noop(self) -> None:
@@ -208,11 +218,13 @@ class Link:
         if self._conn is not None:
             return self._conn
 
-        options: dict[str, Any] = {"keepalive_interval": self.keepalive}
+        options: dict[str, Any] = {'keepalive_interval': self.keepalive}
         if self.user:
-            options["username"] = self.user
+            options['username'] = self.user
         if self.port:
-            options["port"] = self.port
+            options['port'] = self.port
+        if self.ssh_config:
+            options['config'] = [str(self.ssh_config)]
 
         try:
             self._conn = await asyncio.wait_for(
@@ -222,7 +234,7 @@ class Link:
         except _CONNECT_FAILED as exc:
             self._conn = None
             raise LinkError(
-                f"cannot connect to {self.host}: {exc}{_hint(exc)}"
+                f'cannot connect to {self.host}: {exc}{_hint(exc)}'
             ) from exc
 
         return self._conn
@@ -249,7 +261,7 @@ class Link:
             except TimeoutError as exc:
                 proc.terminate()
                 raise LinkError(
-                    f"timed out after {timeout}s on {self.host}: {command}"
+                    f'timed out after {timeout}s on {self.host}: {command}'
                 ) from exc
 
         return Result(
@@ -296,8 +308,8 @@ class Link:
             # permanent refusal (missing sftp subsystem, MaxSessions reached).
             # Report what happened rather than guessing why.
             raise LinkError(
-                f"{self.host}: operation failed after one reconnect "
-                f"attempt: {type(exc).__name__}: {exc}"
+                f'{self.host}: operation failed after one reconnect '
+                f'attempt: {type(exc).__name__}: {exc}'
             ) from exc
 
     def _sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
@@ -335,22 +347,22 @@ def _hint(exc: BaseException) -> str:
     whole job is running commands on someone else's machine.
     """
     text = str(exc).lower()
-    if "host key" in text:
+    if 'host key' in text:
         return (
-            "\nhint: the host is not in ~/.ssh/known_hosts. Connect once with "
-            "`ssh` to record it."
+            '\nhint: the host is not in ~/.ssh/known_hosts. Connect once with '
+            '`ssh` to record it.'
         )
-    if "permission denied" in text or "authentication" in text:
+    if 'permission denied' in text or 'authentication' in text:
         return (
-            "\nhint: key-based authentication failed. Check that `ssh` alone "
-            "succeeds, and that the key is loaded or named in ~/.ssh/config."
+            '\nhint: key-based authentication failed. Check that `ssh` alone '
+            'succeeds, and that the key is loaded or named in ~/.ssh/config.'
         )
-    return ""
+    return ''
 
 
 def _text(raw: object) -> str:
     if raw is None:
-        return ""
+        return ''
     if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
+        return raw.decode('utf-8', errors='replace')
     return str(raw)

@@ -29,9 +29,10 @@ class RemoteCommandError(TetherError):
 
     def __init__(self, result: Result) -> None:
         self.result = result
+        stderr = result.stderr.strip() or '<empty>'
         super().__init__(
-            f"command failed (rc={result.returncode}): {result.command}\n"
-            f"stderr: {result.stderr.strip() or '<empty>'}"
+            f'command failed (rc={result.returncode}): {result.command}\n'
+            f'stderr: {stderr}'
         )
 
 
