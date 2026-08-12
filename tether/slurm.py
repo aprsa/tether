@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
-SEP = "|"
+SEP = '|'
 
 SQUEUE_SPEC = {
     'jobid':         '%i',
@@ -44,21 +44,21 @@ SINFO_SPEC = {
 }
 
 #: Values Slurm uses for "no meaningful duration here".
-_NON_DURATIONS = frozenset({"UNLIMITED", "INVALID", "NOT_SET", "N/A", "", "-"})
+_NON_DURATIONS = frozenset({'UNLIMITED', 'INVALID', 'NOT_SET', 'N/A', '', '-'})
 
 PENDING_STATES = frozenset({
-    "PENDING", "SUSPENDED", "REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD",
-    "RESV_DEL_HOLD", "STOPPED", "SPECIAL_EXIT",
+    'PENDING', 'SUSPENDED', 'REQUEUED', 'REQUEUE_FED', 'REQUEUE_HOLD',
+    'RESV_DEL_HOLD', 'STOPPED', 'SPECIAL_EXIT',
 })
 RUNNING_STATES = frozenset({
-    "RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING",
-    "STAGE_OUT",
+    'RUNNING', 'COMPLETING', 'CONFIGURING', 'RESIZING', 'SIGNALING',
+    'STAGE_OUT',
 })
 FINISHED_STATES = frozenset({
-    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "PREEMPTED",
-    "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "REVOKED",
+    'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED',
+    'BOOT_FAIL', 'DEADLINE', 'OUT_OF_MEMORY', 'REVOKED',
 })
-FAILED_STATES = FINISHED_STATES - {"COMPLETED"}
+FAILED_STATES = FINISHED_STATES - {'COMPLETED'}
 
 
 def spec_format(spec: dict[str, str]) -> str:
@@ -78,15 +78,15 @@ def parse_duration(raw: str) -> timedelta | None:
         return None
 
     days = 0
-    if "-" in text:
-        head, _, text = text.partition("-")
+    if '-' in text:
+        head, _, text = text.partition('-')
         try:
             days = int(head)
         except ValueError:
             return None
 
     try:
-        parts = [int(p) for p in text.split(":")]
+        parts = [int(p) for p in text.split(':')]
     except ValueError:
         return None
 
@@ -107,7 +107,7 @@ def parse_duration(raw: str) -> timedelta | None:
 
 def _int(raw: str) -> int | None:
     """Slurm emits things like '4+' or 'N/A' where an integer is expected."""
-    text = raw.strip().rstrip("+")
+    text = raw.strip().rstrip('+')
     try:
         return int(text)
     except ValueError:
@@ -145,7 +145,7 @@ class Job:
         return self.state in FAILED_STATES
 
     def __str__(self) -> str:
-        return f"{self.jobid} {self.state} {self.name!r} ({self.user})"
+        return f'{self.jobid} {self.state} {self.name!r} ({self.user})'
 
 
 @dataclass(frozen=True)
@@ -163,7 +163,7 @@ class Partition:
 
     @property
     def is_up(self) -> bool:
-        return self.available.lower() == "up"
+        return self.available.lower() == 'up'
 
     @property
     def load(self) -> float | None:
@@ -173,7 +173,7 @@ class Partition:
         return self.nodes_allocated / self.nodes_total
 
     def __str__(self) -> str:
-        return f"{self.name} {self.available} {self.nodes_idle}/{self.nodes_total} idle"
+        return f'{self.name} {self.available} {self.nodes_idle}/{self.nodes_total} idle'
 
 
 def _fields(line: str, count: int) -> list[str] | None:
@@ -193,17 +193,17 @@ def parse_squeue(stdout: str) -> list[Job]:
         f = dict(zip(SQUEUE_SPEC.keys(), (p.strip() for p in parts)))
         jobs.append(
             Job(
-                jobid=f["jobid"],
-                name=f["name"],
-                state=f["state"].upper(),
-                partition=f["partition"],
-                user=f["user"],
-                nodes=_int(f["nodes"]),
-                cpus=_int(f["cpus"]),
-                elapsed=parse_duration(f["elapsed"]),
-                timelimit=parse_duration(f["timelimit"]),
-                reason=f["reason"],
-                workdir=f["workdir"],
+                jobid=f['jobid'],
+                name=f['name'],
+                state=f['state'].upper(),
+                partition=f['partition'],
+                user=f['user'],
+                nodes=_int(f['nodes']),
+                cpus=_int(f['cpus']),
+                elapsed=parse_duration(f['elapsed']),
+                timelimit=parse_duration(f['timelimit']),
+                reason=f['reason'],
+                workdir=f['workdir'],
             )
         )
     return jobs
@@ -220,25 +220,25 @@ def parse_sinfo(stdout: str) -> list[Partition]:
             continue
         f = dict(zip(SINFO_SPEC.keys(), (p.strip() for p in parts)))
 
-        name = f["partition"]
-        is_default = name.endswith("*")
+        name = f['partition']
+        is_default = name.endswith('*')
 
-        counts = [_int(c) for c in f["node_states"].split("/")]
+        counts = [_int(c) for c in f['node_states'].split('/')]
         counts += [None] * (4 - len(counts))
         allocated, idle, other, total = counts[:4]
 
         partitions.append(
             Partition(
-                name=name.rstrip("*"),
+                name=name.rstrip('*'),
                 is_default=is_default,
-                available=f["available"],
-                timelimit=parse_duration(f["timelimit"]),
-                cpus_per_node=_int(f["cpus_per_node"]),
+                available=f['available'],
+                timelimit=parse_duration(f['timelimit']),
+                cpus_per_node=_int(f['cpus_per_node']),
                 nodes_allocated=allocated,
                 nodes_idle=idle,
                 nodes_other=other,
                 nodes_total=total,
-                nodelist=f["nodelist"],
+                nodelist=f['nodelist'],
             )
         )
     return partitions
