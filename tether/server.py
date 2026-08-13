@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
+from . import environment as _environment
 from . import slurm as _slurm
-from .config import EnvironmentConfig, ServerConfig, ServerKind, load_config
-from .errors import ConfigError, SlurmError
+from .config import EnvironmentConfig, EnvironmentKind, ServerConfig, ServerKind, load_config
+from .errors import ConfigError, EnvActivationError, SlurmError
 from .slurm import Job, Partition
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
 
@@ -28,6 +29,26 @@ class Host:
 
     def __str__(self) -> str:
         return f'{self.hostname} ({self.kernel}, {self.cpu_count} cpus)'
+
+
+@dataclass(frozen=True)
+class EnvironmentInfo:
+    """What the remote shell reports *after* the environment was activated.
+
+    The point is to answer "did I get the interpreter I asked for" before a job
+    depends on the answer. `python` and `version` are empty when the remote has
+    no python3 at all, which is a legitimate state for bare metal.
+    """
+
+    label: str
+    kind: str
+    python: str
+    version: str
+    prefix: str
+
+    def __str__(self) -> str:
+        where = self.prefix or 'no python'
+        return f'{self.label or "bare metal"} ({self.kind}): {where}'
 
 
 class Server:
@@ -122,9 +143,70 @@ class Server:
         *,
         check: bool = False,
         timeout: float | None = DEFAULT_TIMEOUT,
+        environment: bool = False,
     ) -> Result:
-        """Run an arbitrary shell command. The escape hatch."""
+        """Run an arbitrary shell command. The escape hatch.
+
+        Raw by default, so scheduler queries and probes are unaffected. Pass
+        `environment=True` to prepend this server's activation lines, which is
+        what a payload wants.
+        """
+        if environment:
+            command = _environment.wrap(self.environment, command)
         return self._link.run(command, check=check, timeout=timeout)
+
+    @property
+    def preamble(self) -> str:
+        """The shell lines that activate this server's environment.
+
+        Empty when no environment is configured. Worth printing when a job
+        misbehaves: it is exactly what runs ahead of the payload.
+        """
+        return _environment.create_preamble(self.environment)
+
+    def verify_environment(self) -> EnvironmentInfo:
+        """Activate the environment and report what came back.
+
+        Call this *before* a job depends on the environment. A failed
+        `conda activate` inside a batch script surfaces later as an unrelated
+        import error, which is a miserable thing to debug; here it is an
+        `EnvActivationError` naming the step that failed.
+        """
+        kind = self.environment.kind if self.environment else EnvironmentKind.NONE
+        label = self.environment.label if self.environment else ''
+
+        result = self.run(_environment.PROBE, environment=True)
+        if not result.ok:
+            raise EnvActivationError(
+                f'environment {label or "(none)"!r} failed to activate on '
+                f'{self.host}: {result.stderr.strip() or "no output"}'
+            )
+
+        reported = (result.stdout.splitlines() + [''] * 5)[:5]
+        virtual_env, conda_prefix, python, version, prefix = (
+            value.strip() for value in reported
+        )
+
+        # Activation can "succeed" and do nothing -- an `activate` script that
+        # is a no-op, or a hook that silently declined. The marker variables are
+        # how we tell that apart from the real thing.
+        expected = {
+            EnvironmentKind.VENV: ('VIRTUAL_ENV', virtual_env),
+            EnvironmentKind.CONDA: ('CONDA_PREFIX', conda_prefix),
+        }.get(kind)  # type: ignore[arg-type]
+        if expected and not expected[1]:
+            raise EnvActivationError(
+                f'environment {label!r} reported success on {self.host} but '
+                f'${expected[0]} is unset, so nothing was activated'
+            )
+
+        return EnvironmentInfo(
+            label=label,
+            kind=str(kind),
+            python=python,
+            version=version,
+            prefix=prefix,
+        )
 
     def put(self, local: str, remote: str, *, recurse: bool = False) -> None:
         self._link.put(local, remote, recurse=recurse)

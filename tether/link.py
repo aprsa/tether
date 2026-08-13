@@ -73,10 +73,6 @@ class Result:
             raise RemoteCommandError(self)
         return self
 
-    def lines(self) -> list[str]:
-        """stdout split into non-empty, stripped lines."""
-        return [ln for ln in (line.strip() for line in self.stdout.splitlines()) if ln]
-
 
 class Link:
     """A reusable SSH connection to one host.

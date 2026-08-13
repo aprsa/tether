@@ -38,3 +38,7 @@ class RemoteCommandError(TetherError):
 
 class SlurmError(TetherError):
     """Slurm is absent, or present and disagreed with us."""
+
+
+class EnvActivationError(TetherError):
+    """An environment did not activate, or activated into the wrong place."""

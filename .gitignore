@@ -37,3 +37,6 @@ ENV/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Generated test-rig key material (throwaway, regenerated on demand)
+tests/cluster/.rig/

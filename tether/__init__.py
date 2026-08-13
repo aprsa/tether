@@ -17,24 +17,28 @@ connection is a disposable, reconnectable link. Jobs outlive Python
 sessions.
 """
 
+from . import environment
 from .config import Config, EnvironmentConfig, ServerConfig, ServerKind, EnvironmentKind, load_config
 from .errors import (
+    EnvActivationError,
     ConfigError,
     RemoteCommandError,
     SlurmError,
     TetherError,
     LinkError,
 )
-from .server import Host, Server, SlurmServer, server
+from .server import EnvironmentInfo, Host, Server, SlurmServer, server
 from .slurm import Job, Partition, parse_duration
 from .link import Result, Link
 
 __version__ = '0.1.0'
 
 __all__ = [
+    'EnvActivationError',
     'Config',
     'ConfigError',
     'EnvironmentConfig',
+    'EnvironmentInfo',
     'EnvironmentKind',
     'Host',
     'Job',
@@ -49,6 +53,7 @@ __all__ = [
     'TetherError',
     'Link',
     'LinkError',
+    'environment',
     'load_config',
     'parse_duration',
     'server',

@@ -29,6 +29,7 @@ is **make reconnection invisible**.
 |---|---|---|
 | 1 | `link.py` | SSH only: `run`, `put`, `get`, reconnect, timeouts |
 | 2 | `slurm.py` | Slurm formats and parsers. Pure — no I/O, unit-testable |
+| 2 | `environment.py` | Shell activation lines. Pure — no I/O, unit-testable |
 | 3 | `server.py` | `Server` / `SlurmServer`: the API PHOEBE talks to |
 
 `Server.run()` is a deliberate escape hatch at every level: tether should never
@@ -71,19 +72,77 @@ workdir = "~/.tether"
 default_environment = "phoebe"
 
 [environment.phoebe]
-kind    = "conda"                  # conda | venv | none
-name    = "phoebe-dev"
-modules = ["openmpi/4.1.5"]
-prelude = []                       # raw shell lines, sourced last
-env     = { OMP_NUM_THREADS = "1" }
-mpirun  = "mpirun"
+kind            = "conda"          # conda | venv | none
+name            = "phoebe-dev"     # conda env name, or venv path
+conda_base      = "/opt/conda"     # conda only; source its hook directly
+modules         = ["openmpi/4.1.6"]
+pre_activation  = []               # raw shell lines, run first
+post_activation = []               # raw shell lines, run last
+env             = { OMP_NUM_THREADS = "1" }
+mpirun          = "mpirun"
 ```
 
 Servers and environments are sibling tables, not nested, so one environment
 definition is reusable across servers. Unknown keys are a hard error — a typo
 in a config file should be loud.
 
-Environments are parsed and validated but inert until job submission lands.
+## Environments
+
+Three kinds are supported: `none` (bare metal), `venv`, and `conda`. The
+generated shell runs in a fixed order, and every slot earns its place:
+
+| Slot | What it is for |
+|---|---|
+| `pre_activation` | Verbatim lines, first. Makes the machinery available. |
+| `modules` | `module load` each entry, in order |
+| `env` | `export` each variable — before activation, so vars that *configure* activation take effect |
+| activation | conda or venv; its `PATH` wins over everything above |
+| `post_activation` | Verbatim lines, last: the final word after activation |
+
+`pre_activation` exists because of a specific cluster reality: `module` is
+normally a shell *function* sourced from `/etc/profile.d`, and `conda activate`
+needs its hook sourced, so a non-interactive shell often cannot run either until
+something makes them available. That is what this slot is for:
+
+```toml
+pre_activation = ["source /etc/profile.d/modules.sh"]
+```
+
+Both verbatim slots run *before* the payload; they differ only in which side of
+activation they land on. Nothing here runs *after* the payload — that belongs to
+the wrapper script and its exit-code trap.
+
+**Failures are loud.** `module load` and activation are emitted with an explicit
+guard that aborts rather than continues. A `conda activate` that quietly fails
+would otherwise run the payload against the wrong interpreter and surface much
+later as an unrelated `ImportError`.
+
+**Verify before you depend on it.** `verify_environment()` activates and reports
+what came back, so a broken environment is caught before a job is built on it:
+
+```python
+with tether.server("terra") as terra:
+    print(terra.preamble)              # exactly what runs ahead of the payload
+    print(terra.verify_environment())  # phoebe (conda): /opt/conda/envs/phoebe-dev
+```
+
+It raises `EnvActivationError` when a step fails, *and* when activation reports
+success but `$VIRTUAL_ENV`/`$CONDA_PREFIX` is unset — that is how "the activate
+script was a no-op" is caught rather than trusted.
+
+`Server.run()` stays raw by default so scheduler queries are unaffected; pass
+`environment=True` to run a command under the activation lines.
+
+**Quoting has one exception worth knowing.** Everything interpolated is
+`shlex.quote`d, *except* a leading `~`, which becomes `"$HOME/..."` — quoting a
+path suppresses tilde expansion, so `source '~/venv/bin/activate'` would look
+correct and silently fail.
+
+Environment variable *values* are quoted, so they are literal: `env` cannot
+reference another variable. Use `pre_activation`/`post_activation` when a value
+has to be computed by the shell.
+
+`mpirun` is parsed but inert until job submission lands.
 
 ## Decisions worth knowing
 
@@ -132,10 +191,11 @@ be `None` when `~/.ssh/config` supplies it.
 
 ```
 TetherError
-├── ConfigError          bad or missing configuration
-├── LinkError            cannot connect, or lost and not recovered
-├── RemoteCommandError   nonzero exit where success was required
-└── SlurmError           Slurm absent, or present and disagreed
+├── ConfigError           bad or missing configuration
+├── EnvActivationError    environment did not activate, or activated nowhere
+├── LinkError             cannot connect, or lost and not recovered
+├── RemoteCommandError    nonzero exit where success was required
+└── SlurmError            Slurm absent, or present and disagreed
 ```
 
 `run()` returns a `Result` and never raises on nonzero exit; pass `check=True`
@@ -149,7 +209,7 @@ which is caught internally.
 
 Milestone 2, deliberately deferred:
 
-- `submit()`, environment activation, file staging into per-job directories
+- `submit()` and file staging into per-job directories
 - `sacct` for finished jobs, plus an exit-code sentinel written into the job
   directory so completion survives `sacct` retention policy
 - `cancel()`, log streaming, reattach-by-directory
@@ -160,20 +220,37 @@ are indistinguishable until `sacct` and sentinels land.
 ## Tests
 
 ```bash
-bash tests/rig.sh start     # local fake cluster: sshd + Slurm shims on :2222
 python -m pytest tests/
-bash tests/rig.sh stop
 ```
 
-`tests/rig.sh` needs **no root** and writes nothing outside `/tmp/tether-rig`.
-It generates its own host key, client key, `authorized_keys`
-and `ssh_config`; the live tests connect to the alias `tether-rig` through that
-file, which also exercises the ssh_config fall-through. `sshd` needs no
-privileges here because the only account it ever authenticates is the one
-running it.
+Unit tests (parsers, preamble generation, quoting) need nothing installed and
+run in well under a second. The live tests run against a **real Slurm cluster in
+a container** — `tests/conftest.py` brings it up on demand, so there is nothing
+to start by hand:
 
-`tests/test_units.py` (parsers, config) needs nothing. `tests/test_live.py`
-covers authentication, channel reuse, timeout-with-terminate, reconnect after a
-dropped link, and SFTP round trips, and skips itself when the rig is down.
-Layer 3 has no other coverage, so set `TETHER_REQUIRE_LIVE=1` in CI to turn that
-skip into a hard error.
+```bash
+docker compose -f tests/cluster/docker-compose.yml up -d --wait   # optional; done for you
+docker compose -f tests/cluster/docker-compose.yml exec cluster sinfo
+docker compose -f tests/cluster/docker-compose.yml down
+```
+
+Nothing in the container is mocked. `slurmctld`, `slurmd`, `slurmdbd` and
+MariaDB actually run, so job states, exit codes, `sbatch` rejections and `sacct`
+history are Slurm's own; conda is a real Miniforge install (pinned and
+checksum-verified); `module` is real environment-modules. That last one matters:
+`module` is a shell *function* from `/etc/profile.d`, absent from a
+non-interactive SSH command, which is exactly the condition `pre_activation`
+exists for — and the tests assert it rather than assume it.
+
+Everything lives in **one container** on purpose. It emulates a single computing
+resource rather than a microservice estate, which also means munge's shared
+secret never crosses a container boundary.
+
+The container is `privileged` because `slurmd` needs a writable cgroup2 tree;
+`cgroup: private` keeps it in its own namespace. It binds only to `127.0.0.1`.
+Key material is generated host-side into `tests/cluster/.rig/` (gitignored) and mounted
+read-only, so `~/.ssh` is never touched.
+
+Live tests skip when Docker is unavailable. Set `TETHER_REQUIRE_LIVE=1` in CI to
+turn that skip into a hard error — layer 3 has no other coverage. The first run
+builds the image, which takes a few minutes; after that a cold start is ~6s.

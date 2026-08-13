@@ -13,18 +13,21 @@ Layout::
     default_environment = "phoebe"
 
     [environment.phoebe]
-    kind    = "conda"                  # conda | venv | none
-    name    = "phoebe-dev"             # conda env name, or venv path
-    modules = ["openmpi/4.1.5"]        # module load, in order
-    prelude = []                       # raw shell lines, sourced last
-    env     = { OMP_NUM_THREADS = "1" }
-    mpirun  = "mpirun"
+    kind            = "conda"          # conda | venv | none
+    name            = "phoebe-dev"     # conda env name, or venv path
+    conda_base      = "/opt/conda"     # conda only; source its hook directly
+    modules         = ["openmpi/4.1.5"]   # module load, in order
+    pre_activation  = []               # raw shell lines, run first
+    post_activation = []               # raw shell lines, run last
+    env             = { OMP_NUM_THREADS = "1" }
+    mpirun          = "mpirun"
 
 Servers and environments are sibling tables, so one environment definition can
 be reused across servers.
 
-Environments are parsed and validated here but not yet acted upon; they become
-live when job submission lands.
+`pre_activation` and `post_activation` are both verbatim shell lines,
+distinguished only by where they land relative to conda/venv activation. Both
+run *before* the payload. See `environment.py` for what belongs in each.
 """
 
 from __future__ import annotations
@@ -58,8 +61,10 @@ class EnvironmentConfig:
     label: str
     kind: EnvironmentKind | str = EnvironmentKind.NONE
     name: str | None = None
+    conda_base: str | None = None
     modules: tuple[str, ...] = ()
-    prelude: tuple[str, ...] = ()
+    pre_activation: tuple[str, ...] = ()
+    post_activation: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     mpirun: str = 'mpirun'
 
@@ -166,6 +171,12 @@ def _environment(path: Path, label: str, body: dict) -> EnvironmentConfig:
     if kind in (EnvironmentKind.CONDA, EnvironmentKind.VENV) and not name:
         raise ConfigError(f"{where}: kind '{kind}' requires 'name'")
 
+    conda_base = body.get('conda_base')
+    if conda_base and kind != EnvironmentKind.CONDA:
+        raise ConfigError(
+            f"{where}: 'conda_base' is only meaningful for kind 'conda', not {kind!r}"
+        )
+
     env = body.get('env', {})
     if not isinstance(env, dict):
         raise ConfigError(f"{where}: 'env' must be a table of strings")
@@ -174,8 +185,10 @@ def _environment(path: Path, label: str, body: dict) -> EnvironmentConfig:
         label=label,
         kind=kind,
         name=name,
+        conda_base=conda_base,
         modules=tuple(body.get('modules', ())),
-        prelude=tuple(body.get('prelude', ())),
+        pre_activation=tuple(body.get('pre_activation', ())),
+        post_activation=tuple(body.get('post_activation', ())),
         env={str(k): str(v) for k, v in env.items()},
         mpirun=body.get('mpirun', 'mpirun'),
     )

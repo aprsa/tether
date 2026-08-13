@@ -1,58 +1,93 @@
-"""End-to-end tests against a real sshd on 127.0.0.1:2222 with Slurm shims.
+"""End-to-end tests against the containerised cluster in `tests/cluster/`.
 
-Exercises the parts that unit tests cannot: authentication, channel reuse,
-timeout-with-terminate, and reconnect after a dropped link.
+Everything here runs against real software: a real slurmctld/slurmd pair, real
+conda, real environment modules, over a real sshd. Nothing is shimmed, so job
+states, exit codes and activation failures are the ones tether will meet on an
+HPC rather than ones a test fixture invented.
 
-Start the rig first: `bash tests/rig.sh start`. These tests connect to the
-alias `tether-rig` through the rig's own ssh_config, so they also exercise the
-documented ssh_config fall-through and never depend on the user's ~/.ssh.
-
-They skip when the rig is down. Set `TETHER_REQUIRE_LIVE=1` to turn that skip
-into a hard error -- layer 3 has no other coverage, so a silent skip in CI
-would mean `server.py` is effectively untested.
+`tests/conftest.py` brings the cluster up on demand; see it for how to drive the
+container by hand.
 """
 
-import os
-import socket
+import shlex
 import time
 
 import pytest
+from conftest import (
+    ALIAS,
+    CONDA_BASE,
+    CONDA_ENV,
+    HOST,
+    MODULE,
+    MODULES_INIT,
+    VENV,
+)
 
 import tether
 
-ALIAS = 'tether-rig'
-HOST = '127.0.0.1'
-RIG = os.environ.get('TETHER_RIG_DIR', '/tmp/tether-rig')
-PORT = int(os.environ.get('TETHER_RIG_PORT', '2222'))
-SSH_CONFIG = os.path.join(RIG, 'ssh_config')
 
-
-def _reachable():
-    if not os.path.exists(SSH_CONFIG):
-        return False
-    with socket.socket() as s:
-        return s.connect_ex((HOST, PORT)) == 0
-
-
-if not _reachable():
-    _why = f'rig is not up on {HOST}:{PORT} (run: bash tests/rig.sh start)'
-    if os.environ.get('TETHER_REQUIRE_LIVE'):
-        raise RuntimeError(f'TETHER_REQUIRE_LIVE is set but the {_why}')
-    pytestmark = pytest.mark.skip(reason=f'no rig: {_why}')
+@pytest.fixture
+def srv(rig):
+    s = tether.SlurmServer(ALIAS, ssh_config=rig)
+    yield s
+    s.close()
 
 
 @pytest.fixture
-def srv(tmp_path):
-    s = tether.SlurmServer(ALIAS, ssh_config=SSH_CONFIG, config_dir=str(tmp_path))
+def plain(rig):
+    s = tether.Server(ALIAS, ssh_config=rig)
     yield s
     s.close()
+
+
+def env_server(rig, tmp_path, body, environment='e'):
+    """A plain Server whose named environment comes from `body`."""
+    (tmp_path / 'servers.toml').write_text(body)
+    return tether.Server(
+        ALIAS, ssh_config=rig, config_dir=str(tmp_path), environment=environment
+    )
+
+
+# -- helpers for driving real jobs ---------------------------------------
+
+
+def submit(srv, script, name='probe', sbatch_args=''):
+    srv.run('mkdir -p ~/jobs', check=True)
+    srv.run(
+        f'printf %s {shlex.quote(script)} > ~/jobs/{name}.sh', check=True
+    )
+    return srv.run(
+        f'cd ~/jobs && sbatch --parsable {sbatch_args} {name}.sh', check=True
+    ).stdout.strip()
+
+
+def wait_for(srv, jobid, timeout=90):
+    """Block until squeue no longer lists the job."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if srv.job(jobid) is None:
+            return
+        time.sleep(0.3)
+    raise AssertionError(f'job {jobid} still queued after {timeout}s')
+
+
+def outcome(srv, jobid):
+    """(JobState, ExitCode) straight from scontrol."""
+    out = srv.run(f'scontrol show job {jobid}', check=True).stdout
+    return (
+        out.split('JobState=')[1].split()[0],
+        out.split('ExitCode=')[1].split()[0],
+    )
+
+
+# -- link layer ----------------------------------------------------------
 
 
 def test_lazy_then_connect(srv):
     assert not srv.connected
     srv.connect()
     assert srv.connected
-    assert srv.slurm_version == 'slurm 23.02.7'
+    assert srv.slurm_version.startswith('slurm')
 
 
 def test_info_and_ping(srv):
@@ -110,55 +145,19 @@ def test_transfer_roundtrip(srv, tmp_path):
     local = tmp_path / 'up.txt'
     local.write_text(payload)
 
-    srv.put(str(local), '/tmp/tether-test.txt')
-    assert srv.run('wc -c < /tmp/tether-test.txt', check=True).stdout.strip() == str(
+    srv.put(str(local), 'tether-test.txt')
+    assert srv.run('wc -c < tether-test.txt', check=True).stdout.strip() == str(
         len(payload)
     )
 
     back = tmp_path / 'down.txt'
-    srv.get('/tmp/tether-test.txt', str(back))
+    srv.get('tether-test.txt', str(back))
     assert back.read_text() == payload
+    srv.run('rm -f tether-test.txt')
 
 
-def test_partitions(srv):
-    parts = {p.name: p for p in srv.partitions()}
-    assert set(parts) == {'main', 'gpu', 'debug'}
-    assert parts['main'].is_default and parts['main'].is_up
-    assert parts['main'].load == pytest.approx(0.75)
-    assert not parts['debug'].is_up
-
-
-def test_queue_defaults_to_all_users(srv):
-    jobs = srv.queue()
-    assert {j.user for j in jobs} == {'andrej', 'kelly'}
-    assert len(jobs) == 3
-
-
-def test_queue_filters_by_user(srv):
-    jobs = srv.queue(user='andrej')
-    assert [j.jobid for j in jobs] == ['12345', '12347']
-    assert all(j.user == 'andrej' for j in jobs)
-
-
-def test_whoami_is_cached(srv):
-    who = srv.whoami()
-    assert who
-    assert srv.whoami() is srv._username
-
-
-def test_job_lookup(srv):
-    job = srv.job(12345)
-    assert job is not None
-    assert job.name == 'phoebe-fit' and job.is_running
-    assert job.elapsed.total_seconds() == 1 * 86400 + 2 * 3600 + 3 * 60 + 4
-
-    assert srv.job(999999) is None       # invalid id is None, not an error
-
-
-def test_context_manager_closes(tmp_path):
-    with tether.SlurmServer(
-        ALIAS, ssh_config=SSH_CONFIG, config_dir=str(tmp_path)
-    ) as s:
+def test_context_manager_closes(rig):
+    with tether.SlurmServer(ALIAS, ssh_config=rig) as s:
         assert s.connected
     assert not s.connected
 
@@ -170,15 +169,14 @@ def test_reuse_after_close(srv):
     assert srv.run('echo again').stdout.strip() == 'again'   # loop recreated
 
 
-def test_plain_server_has_no_slurm_methods(tmp_path):
-    s = tether.server('localhost', kind='plain', config_dir=str(tmp_path))
-    assert isinstance(s, tether.Server) and not isinstance(s, tether.SlurmServer)
-    assert not hasattr(s, 'queue')
+def test_plain_server_has_no_slurm_methods(plain):
+    assert isinstance(plain, tether.Server)
+    assert not isinstance(plain, tether.SlurmServer)
+    assert not hasattr(plain, 'queue')
 
 
-def test_slurm_absence_is_a_hard_error(tmp_path):
-    s = tether.SlurmServer(ALIAS, ssh_config=SSH_CONFIG, config_dir=str(tmp_path))
-    # Hide the shims so `sinfo --version` fails.
+def test_slurm_absence_is_a_hard_error(rig):
+    s = tether.SlurmServer(ALIAS, ssh_config=rig)
     original = s.run
 
     def sabotaged(cmd, **kw):
@@ -192,9 +190,388 @@ def test_slurm_absence_is_a_hard_error(tmp_path):
     s.close()
 
 
-def test_bad_host_raises_link_error(tmp_path):
-    s = tether.Server(
-        host=HOST, port=1, ssh_config=SSH_CONFIG, config_dir=str(tmp_path)
-    )
+def test_bad_host_raises_link_error(rig):
+    s = tether.Server(host=HOST, port=1, ssh_config=rig)
     with pytest.raises(tether.LinkError, match='cannot connect'):
         s.connect()
+
+
+# -- scheduler -----------------------------------------------------------
+
+
+def test_whoami_is_cached(srv):
+    assert srv.whoami() == 'tether'
+    assert srv.whoami() is srv._username
+
+
+def test_partitions(srv):
+    parts = {p.name: p for p in srv.partitions()}
+    assert set(parts) == {'main', 'debug'}
+    assert parts['main'].is_default and parts['main'].is_up
+    assert not parts['debug'].is_default
+    assert parts['main'].nodes_total == 1
+    assert parts['debug'].timelimit.total_seconds() == 300
+
+
+def test_queue_sees_a_real_job(srv):
+    jobid = submit(srv, '#!/bin/bash\nsleep 3\n', name='queued')
+    try:
+        jobs = {j.jobid: j for j in srv.queue()}
+        assert jobid in jobs
+        job = jobs[jobid]
+        assert job.user == 'tether'
+        assert job.partition == 'main'          # the default partition
+        assert job.is_pending or job.is_running
+    finally:
+        srv.run(f'scancel {jobid}')
+        wait_for(srv, jobid)
+
+
+def test_queue_filters_by_user(srv):
+    jobid = submit(srv, '#!/bin/bash\nsleep 3\n', name='mine')
+    try:
+        assert jobid in [j.jobid for j in srv.queue(user='tether')]
+        assert srv.queue(user='nobody') == []
+    finally:
+        srv.run(f'scancel {jobid}')
+        wait_for(srv, jobid)
+
+
+def test_job_lookup_and_disappearance(srv):
+    """`job()` returning None conflates "finished" with "never existed"."""
+    jobid = submit(srv, '#!/bin/bash\nsleep 2\n', name='lookup')
+    found = srv.job(jobid)
+    assert found is not None and found.jobid == jobid
+
+    wait_for(srv, jobid)
+    assert srv.job(jobid) is None          # finished
+    assert srv.job('999999') is None       # never existed -- indistinguishable
+
+
+def test_real_exit_code_survives(srv):
+    """The wrapper/sentinel work in MS2 exists because of exactly this."""
+    jobid = submit(srv, '#!/bin/bash\necho payload\nexit 5\n', name='rc')
+    wait_for(srv, jobid)
+
+    state, exit_code = outcome(srv, jobid)
+    assert state == 'FAILED'
+    assert exit_code == '5:0'
+    assert 'payload' in srv.run(f'cat ~/jobs/slurm-{jobid}.out', check=True).stdout
+
+
+def test_cancelled_job_leaves_no_exit_code(srv):
+    """scancel kills the shell, so nothing the payload writes on exit happens.
+
+    This is the case the exit-code sentinel structurally cannot cover, and why
+    completion detection needs a second source.
+    """
+    jobid = submit(srv, '#!/bin/bash\nsleep 60\n', name='doomed')
+    for _ in range(60):
+        job = srv.job(jobid)
+        if job and job.is_running:
+            break
+        time.sleep(0.3)
+
+    srv.run(f'scancel {jobid}', check=True)
+    wait_for(srv, jobid)
+
+    state, _ = outcome(srv, jobid)
+    assert state == 'CANCELLED'
+
+
+# -- accounting ----------------------------------------------------------
+#
+# These are the reason slurmdbd is in the image. tether has no `sacct` support
+# yet, so they drive it through `run()` -- what they establish is that the rig
+# can express the cases MS2's completion detection has to resolve.
+
+
+def sacct(srv, jobid, fields='JobID,State,ExitCode'):
+    """The allocation row for one job, as a list of fields."""
+    out = srv.run(
+        f'sacct -j {jobid} -X -n --parsable2 --format={fields}', check=True
+    ).stdout.strip()
+    return out.split('|') if out else []
+
+
+def test_sacct_remembers_a_job_squeue_has_forgotten(srv):
+    """The squeue -> sacct handoff, which is why `job()` cannot rely on squeue.
+
+    squeue only knows pending and running jobs; the moment one finishes it is
+    gone from the queue, and only accounting can still say what happened.
+    """
+    jobid = submit(srv, '#!/bin/bash\nexit 5\n', name='acct')
+    wait_for(srv, jobid)
+
+    assert srv.job(jobid) is None                    # squeue: never heard of it
+    assert sacct(srv, jobid) == [jobid, 'FAILED', '5:0']
+
+
+def test_sacct_covers_the_case_the_sentinel_cannot(srv):
+    """A cancelled job's shell is killed, so nothing it would write on exit
+    happens -- no exit-code sentinel is ever created. Accounting is the only
+    remaining source, which is precisely why completion needs two of them.
+
+    Note where the evidence lives, because it is a trap for completion
+    detection: the *allocation* row reports `ExitCode 0:0` even though the job
+    was killed. Only the `.batch` step records the signal. Reading ExitCode off
+    the allocation row alone would call this job a success.
+    """
+    jobid = submit(srv, '#!/bin/bash\nsleep 60\n', name='killed')
+    for _ in range(60):
+        job = srv.job(jobid)
+        if job and job.is_running:
+            break
+        time.sleep(0.3)
+
+    srv.run(f'scancel {jobid}', check=True)
+    wait_for(srv, jobid)
+
+    state, exit_code = sacct(srv, jobid)[1:3]
+    assert state.startswith('CANCELLED')
+    assert exit_code == '0:0'          # ...and yet it plainly did not succeed
+
+    steps = srv.run(
+        f'sacct -j {jobid} -n --parsable2 --format=JobID,State,ExitCode',
+        check=True,
+    ).stdout
+    assert f'{jobid}.batch|CANCELLED|0:15' in steps    # SIGTERM, no exit status
+
+
+def test_sacct_is_silent_about_a_job_that_never_existed(srv):
+    """The other half of the ambiguity: "finished" and "never existed" have to
+    stay distinguishable, and an empty sacct result is what says the latter."""
+    assert sacct(srv, '999999') == []
+
+
+def test_sacct_records_the_submitting_user_and_account(srv):
+    jobid = submit(srv, '#!/bin/bash\ntrue\n', name='who')
+    wait_for(srv, jobid)
+    _, user, account = sacct(srv, jobid, fields='JobID,User,Account')
+    assert user == 'tether'
+    assert account == 'tether'          # the association sacctmgr created
+
+
+def test_bad_partition_is_rejected_by_sbatch(srv):
+    srv.run('mkdir -p ~/jobs', check=True)
+    srv.run("printf '#!/bin/bash\\ntrue\\n' > ~/jobs/bad.sh", check=True)
+    result = srv.run('cd ~/jobs && sbatch --parsable -p nosuchpartition bad.sh')
+
+    assert not result.ok
+    assert 'partition' in result.stderr.lower()
+
+
+# -- environments --------------------------------------------------------
+
+
+def test_venv_activates(rig, tmp_path):
+    srv = env_server(rig, tmp_path, f'[environment.e]\nkind = "venv"\nname = "{VENV}"\n')
+    info = srv.verify_environment()
+    srv.close()
+
+    assert info.kind == 'venv'
+    assert info.prefix == VENV
+    assert info.python.startswith(f'{VENV}/bin/')
+    assert info.version.startswith('3.')
+
+
+def test_conda_activates_via_conda_base(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        f'[environment.e]\nkind = "conda"\n'
+        f'name = "{CONDA_ENV}"\nconda_base = "{CONDA_BASE}"\n',
+    )
+    info = srv.verify_environment()
+    srv.close()
+
+    assert info.kind == 'conda'
+    assert info.prefix == f'{CONDA_BASE}/envs/{CONDA_ENV}'
+    assert info.version.startswith('3.12')
+
+
+def test_conda_without_conda_base_fails_because_conda_is_not_on_path(rig, tmp_path):
+    """The image deliberately keeps conda off PATH, as a real cluster does
+    before the right module is loaded. Without `conda_base` there is nothing to
+    source, and tether must say so rather than run against the wrong python."""
+    srv = env_server(
+        rig, tmp_path, f'[environment.e]\nkind = "conda"\nname = "{CONDA_ENV}"\n'
+    )
+    with pytest.raises(tether.EnvActivationError, match='conda is not on PATH'):
+        srv.verify_environment()
+    srv.close()
+
+
+def test_conda_found_via_pre_activation(rig, tmp_path):
+    """...and sourcing the hook in pre_activation is the documented cure."""
+    srv = env_server(
+        rig,
+        tmp_path,
+        f'[environment.e]\nkind = "conda"\nname = "{CONDA_ENV}"\n'
+        f'pre_activation = ["source {CONDA_BASE}/etc/profile.d/conda.sh"]\n',
+    )
+    info = srv.verify_environment()
+    srv.close()
+    assert info.prefix == f'{CONDA_BASE}/envs/{CONDA_ENV}'
+
+
+def test_bare_metal_reports_system_python(rig, tmp_path):
+    srv = env_server(rig, tmp_path, '[environment.e]\nkind = "none"\n')
+    info = srv.verify_environment()
+    srv.close()
+
+    assert info.kind == 'none'
+    assert info.version.startswith('3.')
+    assert info.prefix == '/usr'          # no environment was entered
+
+
+def test_no_environment_configured_still_verifies(plain):
+    info = plain.verify_environment()
+    assert info.kind == 'none' and info.label == ''
+
+
+def test_missing_venv_is_an_activation_error(rig, tmp_path):
+    srv = env_server(
+        rig, tmp_path, '[environment.e]\nkind = "venv"\nname = "/nonexistent/venv"\n'
+    )
+    with pytest.raises(tether.EnvActivationError, match='could not activate venv'):
+        srv.verify_environment()
+    srv.close()
+
+
+def test_missing_conda_env_is_an_activation_error(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        f'[environment.e]\nkind = "conda"\n'
+        f'name = "no-such-env"\nconda_base = "{CONDA_BASE}"\n',
+    )
+    with pytest.raises(tether.EnvActivationError, match='could not activate conda'):
+        srv.verify_environment()
+    srv.close()
+
+
+# -- modules: the reason pre_activation exists ---------------------------
+
+
+def test_module_is_absent_from_a_non_interactive_shell(plain):
+    """The premise behind `pre_activation`, asserted rather than assumed.
+
+    `module` is a shell function from /etc/profile.d, and a non-interactive SSH
+    command never sources it. This is real cluster behaviour, not a quirk of
+    the container.
+    """
+    assert not plain.run('command -v module').ok
+
+
+def test_module_load_fails_without_pre_activation(rig, tmp_path):
+    srv = env_server(
+        rig, tmp_path, f'[environment.e]\nkind = "none"\nmodules = ["{MODULE}"]\n'
+    )
+    with pytest.raises(tether.EnvActivationError, match='module load'):
+        srv.verify_environment()
+    srv.close()
+
+
+def test_module_load_works_once_pre_activation_sources_it(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        f'[environment.e]\nkind = "none"\n'
+        f'modules = ["{MODULE}"]\n'
+        f'pre_activation = ["source {MODULES_INIT}"]\n',
+    )
+    srv.verify_environment()          # activation succeeds...
+    loaded = srv.run('printf %s "${TETHER_MODULE_LOADED-unset}"', environment=True)
+    srv.close()
+    assert loaded.stdout == '1'       # ...and the modulefile really took effect
+
+
+def test_unknown_module_is_an_activation_error(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        '[environment.e]\nkind = "none"\nmodules = ["no-such-module/9.9"]\n'
+        f'pre_activation = ["source {MODULES_INIT}"]\n',
+    )
+    with pytest.raises(tether.EnvActivationError, match='module load'):
+        srv.verify_environment()
+    srv.close()
+
+
+# -- preamble behaviour --------------------------------------------------
+
+
+def test_env_exports_reach_the_command_only_with_environment_true(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        '[environment.e]\nkind = "none"\nenv = { TETHER_PROBE = "42" }\n',
+    )
+    with_env = srv.run('printf %s "${TETHER_PROBE-unset}"', environment=True)
+    without = srv.run('printf %s "${TETHER_PROBE-unset}"')
+    srv.close()
+
+    assert with_env.stdout == '42'
+    assert without.stdout == 'unset'       # run() stays raw by default
+
+
+def test_verbatim_slots_land_on_the_right_side_of_activation(rig, tmp_path):
+    srv = env_server(
+        rig,
+        tmp_path,
+        f'[environment.e]\n'
+        f'kind = "venv"\n'
+        f'name = "{VENV}"\n'
+        f'pre_activation = [\'echo "pre:${{VIRTUAL_ENV-unset}}"\']\n'
+        f'post_activation = [\'echo "post:${{VIRTUAL_ENV-unset}}"\']\n',
+    )
+    out = srv.run('true', check=True, environment=True).stdout
+    srv.close()
+
+    assert 'pre:unset' in out                        # before activation
+    assert f'post:{VENV}' in out                     # after activation
+
+
+def test_activation_failure_stops_before_the_payload(rig, tmp_path):
+    """The guard must abort, not merely complain and carry on."""
+    srv = env_server(
+        rig, tmp_path, '[environment.e]\nkind = "venv"\nname = "/nonexistent/venv"\n'
+    )
+    result = srv.run('echo PAYLOAD_RAN', environment=True)
+    srv.close()
+
+    assert result.returncode == 1
+    assert 'PAYLOAD_RAN' not in result.stdout
+    assert 'tether:' in result.stderr
+
+
+def test_tilde_paths_expand_remotely(rig, tmp_path, plain):
+    """`~` must survive quoting -- shlex.quote alone would break it."""
+    home = plain.run('printf %s "$HOME"', check=True).stdout
+    plain.run('python3 -m venv ~/tilde-venv', check=True, timeout=180)
+
+    srv = env_server(
+        rig, tmp_path, '[environment.e]\nkind = "venv"\nname = "~/tilde-venv"\n'
+    )
+    try:
+        assert srv.verify_environment().prefix == f'{home}/tilde-venv'
+    finally:
+        plain.run('rm -rf ~/tilde-venv')
+        srv.close()
+
+
+def test_environment_applies_to_a_real_job(rig, tmp_path, srv):
+    """The whole point: a submitted job runs inside the environment."""
+    env = env_server(
+        rig, tmp_path, f'[environment.e]\nkind = "venv"\nname = "{VENV}"\n'
+    )
+    script = '#!/bin/bash\n' + env.preamble + '\npython3 -c "import sys; print(sys.prefix)"\n'
+    env.close()
+
+    jobid = submit(srv, script, name='inenv')
+    wait_for(srv, jobid)
+
+    state, _ = outcome(srv, jobid)
+    assert state == 'COMPLETED'
+    assert srv.run(f'cat ~/jobs/slurm-{jobid}.out', check=True).stdout.strip() == VENV

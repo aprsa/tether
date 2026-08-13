@@ -1,0 +1,48 @@
+# The live-test cluster. `tests/cluster/conftest.py` brings this up on demand.
+#
+#     docker compose -f tests/docker-compose.yml up -d --wait
+#     docker compose -f tests/docker-compose.yml exec cluster sinfo
+#     docker compose -f tests/docker-compose.yml exec cluster sacct
+#     docker compose -f tests/docker-compose.yml down
+
+name: tether-rig
+
+services:
+  cluster:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cluster:latest
+    container_name: cluster
+    hostname: cluster
+
+    # slurmd needs a writable cgroup2 tree, which an unprivileged container
+    # does not get. `cgroup: private` keeps it in its own namespace rather than
+    # letting it at the host's hierarchy.
+    privileged: true
+    cgroup: private
+
+    # Must be bound to loopback: this container has a known private key in
+    # its authorized_keys and must never be reachable off-host.
+    ports:
+      - '127.0.0.1:2222:22'
+
+    # Key material is generated host-side by conftest.py and is read-only:
+    volumes:
+      - ./.rig:/rig:ro
+
+    # Readiness is "the resource is usable", not "the processes started":
+    # a node in a state that can run work, accounting answering, and sshd up.
+    # `up --wait` blocks on this, so no test races the scheduler.
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          sinfo -h -o %T | grep -qE "^(idle|mixed|allocated|completing)$$"
+          && sacct -n -X -S now >/dev/null 2>&1
+          && pgrep -x sshd >/dev/null
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
