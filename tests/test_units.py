@@ -164,3 +164,30 @@ def test_spec_formats_are_stable():
     assert spec_format(SQUEUE_SPEC) == '%i|%T|%P|%u|%D|%C|%M|%l|%R|%Z|%j'
     assert spec_format(SINFO_SPEC) == '%P|%a|%l|%c|%F|%N'
     assert list(SQUEUE_SPEC)[-1] == 'name'   # name last: absorbs an embedded |
+
+
+# -- phase 0: timeouts are configurable -----------------------------------
+
+
+def test_timeout_defaults_to_a_generous_value(tmp_path):
+    srv = tether.server('nowhere.invalid', config_dir=tmp_path)
+    assert srv.timeout == tether.link.DEFAULT_TIMEOUT
+    assert srv.timeout >= 600      # long enough for a conda install
+
+
+def test_timeout_comes_from_the_config_file(tmp_path):
+    (tmp_path / 'servers.toml').write_text('[server.a]\ntimeout = 120\n')
+    assert tether.load_config(tmp_path).server('a').timeout == 120.0
+    assert tether.server('a', config_dir=tmp_path).timeout == 120.0
+
+
+def test_explicit_timeout_beats_the_config_file(tmp_path):
+    (tmp_path / 'servers.toml').write_text('[server.a]\ntimeout = 120\n')
+    assert tether.server('a', config_dir=tmp_path, timeout=5).timeout == 5.0
+
+
+@pytest.mark.parametrize('bad', ['"soon"', '0', '-1', 'true'])
+def test_nonsense_timeouts_are_loud(tmp_path, bad):
+    (tmp_path / 'servers.toml').write_text(f'[server.a]\ntimeout = {bad}\n')
+    with pytest.raises(tether.ConfigError, match='timeout must be'):
+        tether.load_config(tmp_path)

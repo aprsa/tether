@@ -22,6 +22,7 @@ streamed log) rather than long idle periods. Idle drops are handled by (2).
 from __future__ import annotations
 
 import asyncio
+import posixpath
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -32,11 +33,13 @@ import asyncssh
 
 from .errors import RemoteCommandError, TetherError, LinkError
 
-DEFAULT_TIMEOUT = 60.0
-"""Seconds. Applies to commands, not transfers."""
+DEFAULT_TIMEOUT = 3600.0
+# In seconds. Applies to commands, not transfers. Override per call,
+# or per server with `timeout` in `servers.toml`. `None` means no limit
+# at all.
 
 DEFAULT_KEEPALIVE = 30
-"""Seconds between keepalive probes while the loop is running."""
+# Seconds between keepalive probes while the loop is running.
 
 _RETRYABLE = (
     asyncssh.ConnectionLost,
@@ -271,6 +274,9 @@ class Link:
         self, local: str, remote: str, recurse: bool, timeout: float | None
     ) -> None:
         sftp = await self._sftp_client()
+        parent = posixpath.dirname(remote)
+        if parent:
+            await sftp.makedirs(parent, exist_ok=True)
         await asyncio.wait_for(
             sftp.put(local, remote, recurse=recurse), timeout=timeout
         )
@@ -279,6 +285,7 @@ class Link:
         self, remote: str, local: str, recurse: bool, timeout: float | None
     ) -> None:
         sftp = await self._sftp_client()
+        Path(local).parent.mkdir(parents=True, exist_ok=True)
         await asyncio.wait_for(
             sftp.get(remote, local, recurse=recurse), timeout=timeout
         )

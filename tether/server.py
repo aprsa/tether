@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
+import posixpath
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from . import environment as _environment
 from . import slurm as _slurm
@@ -17,6 +18,11 @@ from .config import EnvironmentConfig, EnvironmentKind, ServerConfig, ServerKind
 from .errors import ConfigError, EnvActivationError, SlurmError
 from .slurm import Job, Partition
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
+
+
+_UNSET: Any = object()
+"""Distinguishes "caller said nothing" from an explicit `timeout=None`, which
+means no limit at all. Typed `Any` so the signatures using it stay honest."""
 
 
 @dataclass(frozen=True)
@@ -80,6 +86,7 @@ class Server:
         environment: str | None = None,
         ssh_config: str | Path | None = None,
         config_dir: str | Path | None = None,
+        timeout: float | None = None,
         keepalive: int = DEFAULT_KEEPALIVE,
         connect_timeout: float = 30.0,
     ) -> None:
@@ -93,6 +100,7 @@ class Server:
 
         self.user = user or (cfg.user if cfg else None)
         self.workdir = workdir or (cfg.workdir if cfg else '~/.tether')
+        self.timeout = timeout or (cfg.timeout if cfg else None) or DEFAULT_TIMEOUT
 
         wanted = environment or (cfg.default_environment if cfg else None)
         if wanted and wanted not in config.environments:
@@ -102,6 +110,7 @@ class Server:
         )
 
         self._username: str | None = None
+        self._home: str | None = None
         self._link = Link(
             self.host,
             self.user,
@@ -142,7 +151,7 @@ class Server:
         command: str,
         *,
         check: bool = False,
-        timeout: float | None = DEFAULT_TIMEOUT,
+        timeout: float | None = _UNSET,
         environment: bool = False,
     ) -> Result:
         """Run an arbitrary shell command. The escape hatch.
@@ -150,10 +159,34 @@ class Server:
         Raw by default, so scheduler queries and probes are unaffected. Pass
         `environment=True` to prepend this server's activation lines, which is
         what a payload wants.
+
+        `timeout` defaults to this server's; pass `None` for no limit.
         """
+        if timeout is _UNSET:
+            timeout = self.timeout
         if environment:
             command = _environment.wrap(self.environment, command)
         return self._link.run(command, check=check, timeout=timeout)
+
+    @property
+    def home(self) -> str:
+        """The remote home directory. Resolved once, then cached."""
+        if self._home is None:
+            self._home = self.run('printf %s "$HOME"', check=True).stdout.strip()
+        return self._home
+
+    def path(self, *parts: str) -> str:
+        """An absolute remote path under `workdir`.
+
+        `workdir` defaults to `~/.tether`, and SFTP never expands `~` -- it
+        fails outright rather than creating a literal `~` directory -- so the
+        tilde is resolved here, once, against the remote `$HOME`. Use this for
+        anything handed to `put`/`get`.
+        """
+        base = self.workdir
+        if base == '~' or base.startswith('~/'):
+            base = self.home + base[1:]
+        return posixpath.join(base, *parts)
 
     @property
     def preamble(self) -> str:

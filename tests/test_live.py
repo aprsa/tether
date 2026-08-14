@@ -196,6 +196,80 @@ def test_bad_host_raises_link_error(rig):
         s.connect()
 
 
+# -- phase 0: paths and transfers ----------------------------------------
+
+
+def test_put_creates_every_missing_parent(srv, tmp_path):
+    """`mkdir -p`, not one level.
+
+    SFTP will not create a parent at all, and reports a missing one as a bare
+    "No such file" -- which reads like the *source* is absent. The workdir
+    itself is removed first, so this pins that the whole chain is created and
+    cannot pass by accident because an earlier test made it.
+    """
+    srv.run(f'rm -rf {srv.path()}', check=True)
+    local = tmp_path / 'payload.txt'
+    local.write_text('staged\n')
+    remote = srv.path('a/b/c/d/e/payload.txt')
+
+    srv.put(str(local), remote)
+    try:
+        assert srv.run(f'cat {remote}', check=True).stdout == 'staged\n'
+        made = srv.run(f'find {srv.path()} -type d', check=True).stdout.split()
+        assert len(made) == 6            # the workdir itself, plus a..e
+    finally:
+        srv.run(f'rm -rf {srv.path()}')
+
+
+def test_get_creates_every_missing_local_parent(srv, tmp_path):
+    srv.run('printf fetched > ~/fetch-probe.txt', check=True)
+    local = tmp_path / 'no' / 'such' / 'dir' / 'at' / 'all' / 'out.txt'
+    try:
+        srv.get('fetch-probe.txt', str(local))
+        assert local.read_text() == 'fetched'
+    finally:
+        srv.run('rm -f ~/fetch-probe.txt')
+
+
+def test_path_resolves_the_tilde_in_workdir(srv):
+    """`workdir` defaults to `~/.tether`, and SFTP never expands `~`."""
+    assert srv.workdir == '~/.tether'                  # as configured
+    assert srv.path() == f'{srv.home}/.tether'         # as used
+    assert srv.path('jobs', '42') == f'{srv.home}/.tether/jobs/42'
+    assert srv.home.startswith('/')
+
+
+def test_workdir_is_usable_end_to_end(srv, tmp_path):
+    """The default workdir must survive a real transfer -- it did not before,
+    because `put('~/.tether/x')` fails outright."""
+    local = tmp_path / 'x.txt'
+    local.write_text('ok\n')
+    try:
+        srv.put(str(local), srv.path('probe', 'x.txt'))
+        assert srv.run(f'cat {srv.path("probe/x.txt")}', check=True).stdout == 'ok\n'
+    finally:
+        srv.run(f'rm -rf {srv.path("probe")}')
+
+
+def test_absolute_workdir_is_left_alone(rig):
+    s = tether.Server(ALIAS, ssh_config=rig, workdir='/tmp/tether-abs')
+    try:
+        assert s.path('a') == '/tmp/tether-abs/a'
+    finally:
+        s.close()
+
+
+def test_server_timeout_is_the_default_for_run(rig):
+    s = tether.Server(ALIAS, ssh_config=rig, timeout=2)
+    try:
+        assert s.timeout == 2
+        with pytest.raises(tether.LinkError, match='timed out'):
+            s.run('sleep 30')                      # uses the server default
+        assert s.run('echo fine', timeout=30).stdout.strip() == 'fine'
+    finally:
+        s.close()
+
+
 # -- scheduler -----------------------------------------------------------
 
 

@@ -68,7 +68,8 @@ Optional, in `~/.tether/servers.toml`:
 kind    = "slurm"                  # slurm | plain   (default: slurm)
 host    = "terra.villanova.edu"
 user    = "andrej"
-workdir = "~/.tether"
+workdir = "~/.tether"             # remote scratch root; ~ resolved on use
+timeout = 3600                     # seconds per command (default: 3600)
 default_environment = "phoebe"
 
 [environment.phoebe]
@@ -158,9 +159,19 @@ Idle drops are handled by reconnect-and-retry-once instead.
 
 **Timeouts terminate the remote process.** `conn.run(timeout=...)` in asyncssh
 raises but leaves the remote process running and the channel open; tether wraps
-`create_process` in a context manager and calls `terminate()` explicitly.
-Default 60s for commands, and `None` for transfers — a multi-GB `put` legitimately
-exceeds a minute.
+`create_process` in a context manager and calls `terminate()` explicitly. The
+default is deliberately generous (3600s) because installing conda or compiling a
+package remotely takes minutes, and a timeout that interrupts real work is worse
+than one that lets a wedged command hang; set `timeout` per server in
+`servers.toml`, per call, or `None` for no limit. Transfers are untimed by
+default — a multi-GB `put` legitimately exceeds any of this.
+
+**Remote paths are resolved, not quoted.** `Server.path()` builds absolute paths
+under `workdir`, expanding `~` against the remote `$HOME`. This is not cosmetic:
+SFTP never expands `~`, so `put("~/.tether/x")` fails outright — and `~/.tether`
+is the default workdir. `put`/`get` also create missing parent directories,
+since SFTP reports a missing parent as a bare "No such file" that reads like the
+*source* is absent.
 
 **Host keys are validated, with no opt-out.** A `known_hosts=None` switch would
 be a security footgun in a library whose job is running commands on someone

@@ -79,6 +79,8 @@ class ServerConfig:
     user: str | None = None
     workdir: str = '~/.tether'
     default_environment: str | None = None
+    timeout: float | None = None
+    """Seconds for remote commands; `None` falls back to `DEFAULT_TIMEOUT`."""
 
 
 @dataclass(frozen=True)
@@ -153,7 +155,19 @@ def _server(path: Path, label: str, body: dict) -> ServerConfig:
         user=body.get('user'),
         workdir=body.get('workdir', '~/.tether'),
         default_environment=body.get('default_environment'),
+        timeout=_timeout(where, body.get('timeout')),
     )
+
+
+def _timeout(where: str, raw: object) -> float | None:
+    """`timeout` may be a number of seconds, or absent."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool) or raw <= 0:
+        raise ConfigError(
+            f'{where}: timeout must be a positive number of seconds, not {raw!r}'
+        )
+    return float(raw)
 
 
 def _environment(path: Path, label: str, body: dict) -> EnvironmentConfig:
