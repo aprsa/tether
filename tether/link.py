@@ -22,6 +22,7 @@ streamed log) rather than long idle periods. Idle drops are handled by (2).
 from __future__ import annotations
 
 import asyncio
+import os
 import posixpath
 import time
 from collections.abc import Callable, Coroutine
@@ -172,19 +173,24 @@ class Link:
 
     def put(
         self,
-        local: str,
+        local: str | os.PathLike[str],
         remote: str,
         *,
         recurse: bool = False,
         timeout: float | None = None,
     ) -> None:
-        """Upload. No timeout by default: large transfers legitimately take time."""
+        """Upload. No timeout by default: large transfers legitimately take time.
+
+        `local` accepts a `Path`; `remote` is `str` only, since a local path
+        object carries local separators and has no business describing a path
+        on the far end.
+        """
         self._call(lambda: self._put(local, remote, recurse, timeout))
 
     def get(
         self,
         remote: str,
-        local: str,
+        local: str | os.PathLike[str],
         *,
         recurse: bool = False,
         timeout: float | None = None,
@@ -271,23 +277,42 @@ class Link:
         )
 
     async def _put(
-        self, local: str, remote: str, recurse: bool, timeout: float | None
+        self,
+        local: str | os.PathLike[str],
+        remote: str,
+        recurse: bool,
+        timeout: float | None,
     ) -> None:
         sftp = await self._sftp_client()
+        # SFTP creates no parents and reports a missing one as a bare "No such
+        # file", which reads like the *source* is absent. makedirs is `mkdir -p`.
+        #
+        # posixpath rather than pathlib: the remote is POSIX whatever the client
+        # runs, so `Path` would emit backslashes on Windows. It also yields ''
+        # for a bare filename, where `PurePosixPath(...).parent` yields a truthy
+        # '.' and would cost a needless round trip on every relative put.
         parent = posixpath.dirname(remote)
         if parent:
             await sftp.makedirs(parent, exist_ok=True)
+        # asyncssh takes bytes | str | PurePath, not PathLike in general, so
+        # normalise here rather than advertise something it cannot honour.
         await asyncio.wait_for(
-            sftp.put(local, remote, recurse=recurse), timeout=timeout
+            sftp.put(os.fspath(local), remote, recurse=recurse), timeout=timeout
         )
 
     async def _get(
-        self, remote: str, local: str, recurse: bool, timeout: float | None
+        self,
+        remote: str,
+        local: str | os.PathLike[str],
+        recurse: bool,
+        timeout: float | None,
     ) -> None:
         sftp = await self._sftp_client()
+        # pathlib here, deliberately: this end is the *local* filesystem, so
+        # host semantics are what you want.
         Path(local).parent.mkdir(parents=True, exist_ok=True)
         await asyncio.wait_for(
-            sftp.get(remote, local, recurse=recurse), timeout=timeout
+            sftp.get(remote, os.fspath(local), recurse=recurse), timeout=timeout
         )
 
     # -- sync bridge -------------------------------------------------------

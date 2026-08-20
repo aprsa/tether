@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import posixpath
 import shlex
 from dataclasses import dataclass
@@ -186,6 +187,8 @@ class Server:
         base = self.workdir
         if base == '~' or base.startswith('~/'):
             base = self.home + base[1:]
+        # posixpath, not pathlib: this is a *remote* path, and the remote is
+        # POSIX whatever the caller runs on.
         return posixpath.join(base, *parts)
 
     @property
@@ -241,10 +244,24 @@ class Server:
             prefix=prefix,
         )
 
-    def put(self, local: str, remote: str, *, recurse: bool = False) -> None:
+    def put(
+        self,
+        local: str | os.PathLike[str],
+        remote: str,
+        *,
+        recurse: bool = False,
+    ) -> None:
+        """Upload. `remote` is `str`: build it with `path()`, not `pathlib`."""
         self._link.put(local, remote, recurse=recurse)
 
-    def get(self, remote: str, local: str, *, recurse: bool = False) -> None:
+    def get(
+        self,
+        remote: str,
+        local: str | os.PathLike[str],
+        *,
+        recurse: bool = False,
+    ) -> None:
+        """Download."""
         self._link.get(remote, local, recurse=recurse)
 
     def ping(self) -> float:

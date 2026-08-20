@@ -231,6 +231,21 @@ def test_get_creates_every_missing_local_parent(srv, tmp_path):
         srv.run('rm -f ~/fetch-probe.txt')
 
 
+def test_local_paths_accept_pathlib_objects(srv, tmp_path):
+    """Local ends take a Path; the remote end stays str, since a local path
+    object carries local separators and cannot describe the far side."""
+    local = tmp_path / 'obj.txt'
+    local.write_text('via Path\n')
+
+    srv.put(local, srv.path('objs/obj.txt'))          # note: no str()
+    back = tmp_path / 'fetched' / 'obj.txt'
+    try:
+        srv.get(srv.path('objs/obj.txt'), back)       # ...nor here
+        assert back.read_text() == 'via Path\n'
+    finally:
+        srv.run(f'rm -rf {srv.path("objs")}')
+
+
 def test_path_resolves_the_tilde_in_workdir(srv):
     """`workdir` defaults to `~/.tether`, and SFTP never expands `~`."""
     assert srv.workdir == '~/.tether'                  # as configured
