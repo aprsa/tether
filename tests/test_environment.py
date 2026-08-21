@@ -13,8 +13,13 @@ import subprocess
 import pytest
 
 import tether
-from tether.config import EnvironmentConfig, EnvironmentKind
-from tether.environment import create_preamble, remote_path, wrap
+from tether.environment import (
+    EnvironmentKind,
+    create_preamble,
+    remote_path,
+    wrap,
+)
+from tether.environment import env as make_env
 
 
 def write_server(config_dir, name='x', **body):
@@ -25,9 +30,11 @@ def write_server(config_dir, name='x', **body):
     return path
 
 
-def env(**kwargs) -> EnvironmentConfig:
-    kwargs.setdefault('label', 'test')
-    return EnvironmentConfig(**kwargs)
+def env(**kwargs):
+    """Build an environment of whatever kind the keywords name."""
+    name = kwargs.pop('name', 'test')
+    kind = kwargs.pop('kind', EnvironmentKind.NONE)
+    return make_env(name, kind, **kwargs)
 
 
 def preamble_lines(cfg) -> list[str]:
@@ -47,7 +54,7 @@ def preamble_lines(cfg) -> list[str]:
 def test_slots_appear_in_documented_order():
     cfg = env(
         kind=EnvironmentKind.VENV,
-        name='/opt/venv',
+        path='/opt/venv',
         modules=('openmpi/4.1.5',),
         pre_activation=('source /etc/profile.d/modules.sh',),
         post_activation=('export PYTHONPATH=/late',),
@@ -97,12 +104,12 @@ def test_no_environment_at_all_is_empty():
 
 
 def test_venv_sources_the_activate_script():
-    cfg = env(kind=EnvironmentKind.VENV, name='/opt/venv')
+    cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv')
     assert 'source /opt/venv/bin/activate' in create_preamble(cfg)
 
 
 def test_venv_tolerates_a_trailing_slash():
-    cfg = env(kind=EnvironmentKind.VENV, name='/opt/venv/')
+    cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv/')
     assert '/opt/venv/bin/activate' in create_preamble(cfg)
     assert '//bin' not in create_preamble(cfg)
 
@@ -111,7 +118,7 @@ def test_conda_checks_for_conda_then_sources_the_hook_then_activates():
     """The presence check must be its own line: `eval "$(conda ...)"` reports
     the status of the evaluated string, so a missing conda would slip past a
     guard on the eval itself."""
-    cfg = env(kind=EnvironmentKind.CONDA, name='phoebe-dev')
+    cfg = env(kind=EnvironmentKind.CONDA, conda_env='phoebe-dev')
     got = preamble_lines(cfg)
     assert 'command -v conda' in got[0]
     assert 'conda is not on PATH' in got[0]
@@ -120,28 +127,35 @@ def test_conda_checks_for_conda_then_sources_the_hook_then_activates():
 
 
 def test_conda_base_sources_the_hook_directly():
-    cfg = env(kind=EnvironmentKind.CONDA, name='phoebe', conda_base='/opt/conda')
+    cfg = env(kind=EnvironmentKind.CONDA, conda_env='phoebe', conda_base='/opt/conda')
     got = preamble_lines(cfg)
     assert 'source /opt/conda/etc/profile.d/conda.sh' in got[0]
     assert 'conda shell.bash hook' not in got[0]
 
 
-def test_conda_without_name_is_an_error():
-    cfg = env(kind=EnvironmentKind.CONDA, name=None)
-    with pytest.raises(tether.ConfigError, match="requires 'name'"):
-        create_preamble(cfg)
+def test_conda_env_defaults_to_the_environment_name():
+    """For conda the two are usually the same word, so saying it twice is
+    noise. A venv `path` is a path, so it is never guessed -- see below."""
+    assert env(kind=EnvironmentKind.CONDA).conda_env == 'test'
+    assert 'conda activate test' in create_preamble(env(kind=EnvironmentKind.CONDA))
+
+
+def test_venv_without_a_path_is_refused_at_construction():
+    """Not at use: an invalid environment must never reach a config file."""
+    with pytest.raises(tether.ConfigError, match="a venv needs 'path'"):
+        env(kind=EnvironmentKind.VENV)
 
 
 def test_unknown_kind_is_an_error():
-    cfg = env(kind='poetry', name='x')
     with pytest.raises(tether.ConfigError, match='unsupported kind'):
-        create_preamble(cfg)
+        env(kind='poetry', conda_env='x')
 
 
-def test_unknown_kind_is_reported_as_such_even_without_a_name():
-    """The kind is the actual problem; do not blame the missing name."""
-    with pytest.raises(tether.ConfigError, match='unsupported kind'):
-        create_preamble(env(kind='poetry'))
+def test_fields_of_another_kind_are_refused():
+    """`conda_base` is not a field on a venv, so the class rejects it without
+    anyone writing a check for it."""
+    with pytest.raises(tether.ConfigError, match='not valid for kind'):
+        env(kind=EnvironmentKind.VENV, path='/opt/v', conda_base='/opt/conda')
 
 
 # -- failure is loud ------------------------------------------------------
@@ -150,7 +164,7 @@ def test_unknown_kind_is_reported_as_such_even_without_a_name():
 @pytest.mark.parametrize(
     'cfg',
     [
-        env(kind=EnvironmentKind.VENV, name='/opt/venv'),
+        env(kind=EnvironmentKind.VENV, path='/opt/venv'),
         env(kind=EnvironmentKind.CONDA, name='phoebe'),
         env(kind=EnvironmentKind.NONE, modules=('gcc',)),
     ],
@@ -194,7 +208,7 @@ HOSTILE = ['x; rm -rf /', 'x$(whoami)', 'x`id`', "x'y", 'x&&y', 'x|y', 'x\nrm -r
 
 @pytest.mark.parametrize('hostile', HOSTILE)
 def test_venv_path_stays_one_quoted_word(hostile):
-    got = create_preamble(env(kind=EnvironmentKind.VENV, name=hostile))
+    got = create_preamble(env(kind=EnvironmentKind.VENV, path=hostile))
     assert f'source {remote_path(hostile.rstrip("/") + "/bin/activate")}' in got
 
 
@@ -211,7 +225,7 @@ def test_env_values_are_quoted(hostile):
 def test_hostile_venv_path_cannot_execute(tmp_path, template):
     canary = tmp_path / 'canary'
     canary.write_text('alive')
-    script = create_preamble(env(kind=EnvironmentKind.VENV, name=template.format(canary=canary)))
+    script = create_preamble(env(kind=EnvironmentKind.VENV, path=template.format(canary=canary)))
 
     # check=False: a nonzero exit is the expected outcome here.
     done = subprocess.run(
@@ -269,7 +283,7 @@ def test_verbatim_slots_are_not_quoted():
 
 
 def test_wrap_puts_the_command_last():
-    cfg = env(kind=EnvironmentKind.VENV, name='/opt/venv')
+    cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv')
     got = wrap(cfg, 'python run.py')
     assert got.endswith('\npython run.py')
     assert got.startswith('source /opt/venv/bin/activate')
@@ -286,13 +300,13 @@ def test_config_reads_the_new_keys(tmp_path):
     write_server(tmp_path, 'x', environments={
         'phoebe': {
             'kind': 'conda',
-            'name': 'phoebe-dev',
+            'conda_env': 'phoebe-dev',
             'conda_base': '/opt/conda',
             'pre_activation': ['source /etc/profile.d/modules.sh'],
             'post_activation': ['echo late'],
         }
     })
-    cfg = tether.load_server('x', tmp_path).environments['phoebe']
+    cfg = tether.server('x', config_dir=tmp_path).environments['phoebe']
     assert cfg.conda_base == '/opt/conda'
     assert cfg.pre_activation == ('source /etc/profile.d/modules.sh',)
     assert cfg.post_activation == ('echo late',)
@@ -307,22 +321,22 @@ def test_superseded_key_names_are_rejected_not_ignored(tmp_path):
     for superseded in ('bootstrap', 'prelude'):
         write_server(tmp_path, 'x',
                      environments={'e': {superseded: ['echo hi']}})
-        with pytest.raises(tether.ConfigError, match='unknown key'):
-            tether.load_server('x', tmp_path)
+        with pytest.raises(tether.ConfigError, match='not valid for kind'):
+            tether.server('x', config_dir=tmp_path)
 
 
 def test_conda_base_on_a_non_conda_environment_is_loud(tmp_path):
     write_server(tmp_path, 'x', environments={
-        'e': {'kind': 'venv', 'name': '/opt/v', 'conda_base': '/opt/conda'}
+        'e': {'kind': 'venv', 'path': '/opt/v', 'conda_base': '/opt/conda'}
     })
-    with pytest.raises(tether.ConfigError, match='only meaningful for'):
-        tether.load_server('x', tmp_path)
+    with pytest.raises(tether.ConfigError, match='not valid for kind'):
+        tether.server('x', config_dir=tmp_path)
 
 
 def test_server_exposes_the_preamble(tmp_path):
     write_server(tmp_path, 'x',
                  default_environment='e',
-                 environments={'e': {'kind': 'venv', 'name': '~/venvs/phoebe'}})
+                 environments={'e': {'kind': 'venv', 'path': '~/venvs/phoebe'}})
     srv = tether.server('x', config_dir=tmp_path)
     assert 'source "$HOME/venvs/phoebe/bin/activate"' in srv.preamble
 

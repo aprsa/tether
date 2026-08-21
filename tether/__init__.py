@@ -18,16 +18,14 @@ sessions.
 """
 
 from . import environment
-from .config import (
-    EnvironmentConfig,
+from .config import ServerKind, delete_server, list_servers, server_path
+from .environment import (
+    Environment,
     EnvironmentKind,
-    ServerConfig,
-    ServerKind,
-    delete_server,
-    load_server,
-    save_server,
-    server_path,
-    list_servers,
+    SystemEnvironment,
+    VenvEnvironment,
+    CondaEnvironment,
+    env,
 )
 from .errors import (
     EnvActivationError,
@@ -46,26 +44,27 @@ __version__ = '0.1.0'
 __all__ = [
     'EnvActivationError',
     'ConfigError',
-    'EnvironmentConfig',
+    'Environment',
     'EnvironmentInfo',
     'EnvironmentKind',
+    'SystemEnvironment',
+    'VenvEnvironment',
+    'CondaEnvironment',
     'Host',
     'Job',
     'Partition',
     'RemoteCommandError',
     'Result',
     'Server',
-    'ServerConfig',
     'ServerKind',
     'SlurmError',
     'SlurmServer',
     'TetherError',
     'Link',
     'LinkError',
+    'env',
     'environment',
     'delete_server',
-    'load_server',
-    'save_server',
     'server_path',
     'list_servers',
     'parse_duration',

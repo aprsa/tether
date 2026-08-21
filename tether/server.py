@@ -11,17 +11,12 @@ import posixpath
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 from . import environment as _environment
 from . import slurm as _slurm
-from .config import (
-    EnvironmentConfig,
-    EnvironmentKind,
-    ServerConfig,
-    ServerKind,
-    load_server,
-)
+from .config import DEFAULT_WORKDIR, ServerKind, _load_server, _save_server
+from .environment import Environment
 from .errors import ConfigError, EnvActivationError, SlurmError
 from .slurm import Job, Partition
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
@@ -53,7 +48,7 @@ class EnvironmentInfo:
     no python3 at all, which is a legitimate state for bare metal.
     """
 
-    label: str
+    name: str
     kind: str
     python: str
     version: str
@@ -61,7 +56,7 @@ class EnvironmentInfo:
 
     def __str__(self) -> str:
         where = self.prefix or 'no python'
-        return f'{self.label or "bare metal"} ({self.kind}): {where}'
+        return f'{self.name or "bare metal"} ({self.kind}): {where}'
 
 
 class Server:
@@ -71,7 +66,7 @@ class Server:
     composes everything needed to work with a resource:
 
     - a `Link`, the single SSH connection, reconnected invisibly as needed;
-    - an `EnvironmentConfig`, the environment its commands run under;
+    - an `Environment`, the environment its commands run under;
     - `workdir`, the remote scratch root that `path()` resolves against;
     - `timeout`, the default deadline for its commands.
 
@@ -93,6 +88,10 @@ class Server:
     rather than constructing many for the same host.
     """
 
+    kind: ClassVar[ServerKind] = ServerKind.PLAIN
+    """Which class a saved config maps back to. A class attribute rather than a
+    field, so a stored kind can never disagree with the class holding it."""
+
     def __init__(
         self,
         name: str | None = None,
@@ -109,27 +108,36 @@ class Server:
         keepalive: int = DEFAULT_KEEPALIVE,
         connect_timeout: float = 30.0,
     ) -> None:
-        cfg: ServerConfig | None = load_server(name, config_dir) if name else None
+        saved = _load_server(name, config_dir) if name else None
 
-        self.label = name
-        self.host = host or (cfg.host if cfg else name)
+        # A saved kind that disagrees with the class is the one mistake worth
+        # catching: you would silently get a Server where the file says slurm,
+        # and only notice when `queue()` turned out not to exist.
+        if saved and saved['kind'] != type(self).kind:
+            raise ConfigError(
+                f"'{name}' is configured as kind '{saved['kind']}', not "
+                f"'{type(self).kind}'; use tether.server('{name}')"
+            )
+        saved = saved or {}
+
+        self.name = name
+        self.host = host or saved.get('host') or name
         if not self.host:
             raise ConfigError('a server needs a name or an explicit host')
 
-        self.user = user or (cfg.user if cfg else None)
-        self.workdir = workdir or (cfg.workdir if cfg else '~/.tether')
-        self.timeout = timeout or (cfg.timeout if cfg else None) or DEFAULT_TIMEOUT
+        self.user = user or saved.get('user')
+        self.workdir = workdir or saved.get('workdir') or DEFAULT_WORKDIR
+        self.timeout = timeout or saved.get('timeout') or DEFAULT_TIMEOUT
 
-        wanted = environment or (cfg.default_environment if cfg else None)
-        available = cfg.environments if cfg else {}
-        if wanted and wanted not in available:
-            raise ConfigError(
-                f"unknown environment '{wanted}' for server '{name}'; "
-                f'defined here: {sorted(available) or "none"}'
-            )
-        self.environment: EnvironmentConfig | None = (
-            available.get(wanted) if wanted else None
+        self.environments: dict[str, Environment] = dict(
+            saved.get('environments', {})
         )
+        self.default_environment = environment or saved.get('default_environment')
+        if self.default_environment and self.default_environment not in self.environments:
+            raise ConfigError(
+                f"unknown environment '{self.default_environment}' for server "
+                f"'{name}'; defined here: {sorted(self.environments) or 'none'}"
+            )
 
         self._username: str | None = None
         self._home: str | None = None
@@ -146,6 +154,51 @@ class Server:
             keepalive=keepalive,
             connect_timeout=connect_timeout,
         )
+
+    @property
+    def environment(self) -> Environment | None:
+        """The selected environment, or `None` when none is configured.
+
+        `None` is not bare metal: bare metal is a `SystemEnvironment`, which
+        still loads modules and exports variables. `None` means there is
+        nothing to prepare at all.
+        """
+        if self.default_environment is None:
+            return None
+        return self.environments.get(self.default_environment)
+
+    def add_environment(self, env: Environment, *, default: bool = False) -> Environment:
+        """Declare an environment on this server. Returns it, for chaining."""
+        self.environments[env.name] = env
+        if default or self.default_environment is None:
+            self.default_environment = env.name
+        return env
+
+    def to_dict(self) -> dict:
+        """The JSON body `save()` writes. Runtime state -- the link, cached
+        lookups -- is deliberately not part of it."""
+        body: dict = {'kind': str(self.kind), 'host': self.host}
+        if self.user:
+            body['user'] = self.user
+        if self.workdir != DEFAULT_WORKDIR:
+            body['workdir'] = self.workdir
+        if self.timeout != DEFAULT_TIMEOUT:
+            body['timeout'] = self.timeout
+        if self.default_environment:
+            body['default_environment'] = self.default_environment
+        if self.environments:
+            body['environments'] = {
+                name: env.to_dict() for name, env in self.environments.items()
+            }
+        return body
+
+    def save(self, *, config_dir: str | Path | None = None,
+             overwrite: bool = False) -> Path:
+        """Write this server to `~/.tether/servers/<name>.json`."""
+        if not self.name:
+            raise ConfigError('a server needs a name before it can be saved')
+        return _save_server(self.name, self.to_dict(),
+                            config_dir=config_dir, overwrite=overwrite)
 
     @property
     def link(self) -> Link:
@@ -234,10 +287,18 @@ class Server:
         import error, which is a miserable thing to debug; here it is an
         `EnvActivationError` naming the step that failed.
         """
-        kind = self.environment.kind if self.environment else EnvironmentKind.NONE
-        label = self.environment.label if self.environment else ''
+        env = self.environment
+        kind = env.kind if env else 'none'
+        label = env.name if env else ''
 
-        result = self.run(_environment.PROBE, environment=True)
+        env_probe = (
+            'printf \'%s\\n%s\\n\' "${VIRTUAL_ENV-}" "${CONDA_PREFIX-}"\n'
+            'command -v python3 >/dev/null 2>&1 && python3 -c '
+            "'import sys; print(sys.executable); print(sys.version.split()[0]); "
+            "print(sys.prefix)'"
+        )
+
+        result = self.run(env_probe, environment=True)
         if not result.ok:
             raise EnvActivationError(
                 f'environment {label or "(none)"!r} failed to activate on '
@@ -250,20 +311,18 @@ class Server:
         )
 
         # Activation can "succeed" and do nothing -- an `activate` script that
-        # is a no-op, or a hook that silently declined. The marker variables are
-        # how we tell that apart from the real thing.
-        expected = {
-            EnvironmentKind.VENV: ('VIRTUAL_ENV', virtual_env),
-            EnvironmentKind.CONDA: ('CONDA_PREFIX', conda_prefix),
-        }.get(kind)  # type: ignore[arg-type]
-        if expected and not expected[1]:
+        # is a no-op, or a hook that silently declined. Each kind names the
+        # variable that proves otherwise; bare metal names none.
+        marker = env.marker if env else None
+        reported = {'VIRTUAL_ENV': virtual_env, 'CONDA_PREFIX': conda_prefix}
+        if marker and not reported[marker]:
             raise EnvActivationError(
                 f'environment {label!r} reported success on {self.host} but '
-                f'${expected[0]} is unset, so nothing was activated'
+                f'${marker} is unset, so nothing was activated'
             )
 
         return EnvironmentInfo(
-            label=label,
+            name=label,
             kind=str(kind),
             python=python,
             version=version,
@@ -319,6 +378,8 @@ class SlurmServer(Server):
     first scheduler query, and its absence is a hard `SlurmError`: if you say a
     server runs Slurm, tether trusts you and complains loudly if you are wrong.
     """
+
+    kind: ClassVar[ServerKind] = ServerKind.SLURM
 
     _slurm_version: str | None = None
 
@@ -394,7 +455,7 @@ class SlurmServer(Server):
         return jobs[0] if jobs else None
 
 
-server_dict: dict[ServerKind, type[Server]] = {
+SERVERS: dict[ServerKind, type[Server]] = {
     ServerKind.PLAIN: Server,
     ServerKind.SLURM: SlurmServer,
 }
@@ -415,8 +476,8 @@ def server(name: str | None = None, *, kind: ServerKind | str | None = None, **k
                 f'config_dir must be a str, Path or None, '
                 f'not {type(config_dir).__name__}'
             )
-        cfg = load_server(name, config_dir) if name else None
-        kind = cfg.kind if cfg else ServerKind.SLURM
+        saved = _load_server(name, config_dir) if name else None
+        kind = saved['kind'] if saved else ServerKind.SLURM
 
     try:
         kind = ServerKind(kind)
@@ -426,4 +487,4 @@ def server(name: str | None = None, *, kind: ServerKind | str | None = None, **k
             f'expected one of {[k.value for k in ServerKind]}'
         ) from None
 
-    return server_dict[kind](name, **kwargs)  # type: ignore[arg-type]
+    return SERVERS[kind](name, **kwargs)  # type: ignore[arg-type]

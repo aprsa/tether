@@ -457,7 +457,7 @@ def test_bad_partition_is_rejected_by_sbatch(srv):
 
 
 def test_venv_activates(rig, tmp_path):
-    srv = env_server(rig, tmp_path, kind='venv', name=VENV)
+    srv = env_server(rig, tmp_path, kind='venv', path=VENV)
     info = srv.verify_environment()
     srv.close()
 
@@ -468,7 +468,7 @@ def test_venv_activates(rig, tmp_path):
 
 
 def test_conda_activates_via_conda_base(rig, tmp_path):
-    srv = env_server(rig, tmp_path, kind='conda', name=CONDA_ENV, conda_base=CONDA_BASE)
+    srv = env_server(rig, tmp_path, kind='conda', conda_env=CONDA_ENV, conda_base=CONDA_BASE)
     info = srv.verify_environment()
     srv.close()
 
@@ -481,7 +481,7 @@ def test_conda_without_conda_base_fails_because_conda_is_not_on_path(rig, tmp_pa
     """The image deliberately keeps conda off PATH, as a real cluster does
     before the right module is loaded. Without `conda_base` there is nothing to
     source, and tether must say so rather than run against the wrong python."""
-    srv = env_server(rig, tmp_path, kind='conda', name=CONDA_ENV)
+    srv = env_server(rig, tmp_path, kind='conda', conda_env=CONDA_ENV)
     with pytest.raises(tether.EnvActivationError, match='conda is not on PATH'):
         srv.verify_environment()
     srv.close()
@@ -493,7 +493,7 @@ def test_conda_found_via_pre_activation(rig, tmp_path):
         rig,
         tmp_path,
         kind='conda',
-        name=CONDA_ENV,
+        conda_env=CONDA_ENV,
         pre_activation=[f'source {CONDA_BASE}/etc/profile.d/conda.sh'],
     )
     info = srv.verify_environment()
@@ -513,11 +513,11 @@ def test_bare_metal_reports_system_python(rig, tmp_path):
 
 def test_no_environment_configured_still_verifies(plain):
     info = plain.verify_environment()
-    assert info.kind == 'none' and info.label == ''
+    assert info.kind == 'none' and info.name == ''
 
 
 def test_missing_venv_is_an_activation_error(rig, tmp_path):
-    srv = env_server(rig, tmp_path, kind='venv', name='/nonexistent/venv')
+    srv = env_server(rig, tmp_path, kind='venv', path='/nonexistent/venv')
     with pytest.raises(tether.EnvActivationError, match='could not activate venv'):
         srv.verify_environment()
     srv.close()
@@ -525,7 +525,7 @@ def test_missing_venv_is_an_activation_error(rig, tmp_path):
 
 def test_missing_conda_env_is_an_activation_error(rig, tmp_path):
     srv = env_server(
-        rig, tmp_path, kind='conda', name='no-such-env', conda_base=CONDA_BASE
+        rig, tmp_path, kind='conda', conda_env='no-such-env', conda_base=CONDA_BASE
     )
     with pytest.raises(tether.EnvActivationError, match='could not activate conda'):
         srv.verify_environment()
@@ -597,7 +597,7 @@ def test_verbatim_slots_land_on_the_right_side_of_activation(rig, tmp_path):
         rig,
         tmp_path,
         kind='venv',
-        name=VENV,
+        path=VENV,
         pre_activation=['echo "pre:${VIRTUAL_ENV-unset}"'],
         post_activation=['echo "post:${VIRTUAL_ENV-unset}"'],
     )
@@ -610,7 +610,7 @@ def test_verbatim_slots_land_on_the_right_side_of_activation(rig, tmp_path):
 
 def test_activation_failure_stops_before_the_payload(rig, tmp_path):
     """The guard must abort, not merely complain and carry on."""
-    srv = env_server(rig, tmp_path, kind='venv', name='/nonexistent/venv')
+    srv = env_server(rig, tmp_path, kind='venv', path='/nonexistent/venv')
     result = srv.run('echo PAYLOAD_RAN', environment=True)
     srv.close()
 
@@ -624,7 +624,7 @@ def test_tilde_paths_expand_remotely(rig, tmp_path, plain):
     home = plain.run('printf %s "$HOME"', check=True).stdout
     plain.run('python3 -m venv ~/tilde-venv', check=True, timeout=180)
 
-    srv = env_server(rig, tmp_path, kind='venv', name='~/tilde-venv')
+    srv = env_server(rig, tmp_path, kind='venv', path='~/tilde-venv')
     try:
         assert srv.verify_environment().prefix == f'{home}/tilde-venv'
     finally:
@@ -634,7 +634,7 @@ def test_tilde_paths_expand_remotely(rig, tmp_path, plain):
 
 def test_environment_applies_to_a_real_job(rig, tmp_path, srv):
     """The whole point: a submitted job runs inside the environment."""
-    env = env_server(rig, tmp_path, kind='venv', name=VENV)
+    env = env_server(rig, tmp_path, kind='venv', path=VENV)
     script = '#!/bin/bash\n' + env.preamble + '\npython3 -c "import sys; print(sys.prefix)"\n'
     env.close()
 

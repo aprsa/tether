@@ -97,20 +97,55 @@ meant for a different machine.
 them, and the standard library can only *read* TOML. That keeps the runtime
 dependency list at one.
 
+There is one type, not two: a `Server` *is* its configuration, plus a link.
+
 ```python
-tether.save_server(cfg)            # -> ~/.tether/servers/terra.json
-tether.load_server("terra")        # -> ServerConfig | None
-tether.servers()                   # -> ["terra", ...]
+srv = tether.server("terra", host="terra.villanova.edu", user="andrej")
+srv.add_environment(tether.CondaEnvironment("phoebe", conda_base="/opt/conda"))
+srv.add_environment(tether.VenvEnvironment("dev", path="~/venvs/dev"))
+srv.save()                         # -> ~/.tether/servers/terra.json
+
+tether.list_servers()              # -> ["terra", ...]
 tether.delete_server("terra")
 ```
 
 Saving omits anything left at its default, so a file records what was actually
-chosen rather than every default in force the day it was written.
+chosen rather than every default in force the day it was written. Runtime state
+— the connection, cached lookups — is never written.
+
+`tether.server()` picks the class from the stored `kind`, which a plain
+constructor cannot do: the class depends on what the file says. Constructing the
+wrong one directly is a loud error rather than a silently degraded object.
 
 ## Environments
 
-Three kinds are supported: `none` (bare metal), `venv`, and `conda`. The
-generated shell runs in a fixed order, and every slot earns its place:
+One class per kind — `SystemEnvironment` (bare metal), `VenvEnvironment`,
+`CondaEnvironment` — each owning its own fields, validation and activation
+lines. Adding a kind is adding a class, not adding a branch to four `if kind ==`
+chains:
+
+```python
+tether.CondaEnvironment("phoebe", conda_base="/opt/conda")
+tether.VenvEnvironment("dev", path="~/venvs/dev", modules=["gcc"])
+tether.SystemEnvironment("bare")
+
+tether.env("dev", "venv", path="~/venvs/dev")   # or by kind, mirroring server()
+```
+
+The first argument is the environment's **name**: tether's handle for it, and
+its key in the config file. It is not what gets activated — a venv named `dev`
+may live at `/scratch/venvs/phoebe-2.5`, and that name appears nowhere in the
+generated shell. What each kind activates is named for what it actually is: a
+venv has a `path` (there is no such thing as a venv *name*), and a conda
+environment has a `conda_env`, which defaults to the name since the two are
+usually the same word.
+
+Fields belonging to another kind are refused because they are not fields on
+that class — `conda_base` on a venv is an error nobody had to write a check
+for. Validation happens at construction, so an environment that cannot be
+loaded back cannot be built in the first place, let alone saved.
+
+The generated shell runs in a fixed order, and every slot earns its place:
 
 | Slot | What it is for |
 |---|---|

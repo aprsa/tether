@@ -33,17 +33,18 @@ optional: with no file at all, a server name falls through to ``~/.ssh/config``.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import re
-from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from .environment import Environment, EnvironmentKind, env
 from .errors import ConfigError
 
 DEFAULT_CONFIG_DIR = Path.home() / '.tether'
 SERVERS_DIRNAME = 'servers'
+DEFAULT_WORKDIR = '~/.tether'
+# The remote scratch root, unless a server says otherwise.
 VERSION_KEY = 'tether'
 # Stamped into every file tether writes, so a later version can recognise an
 # older layout instead of guessing at it.
@@ -56,42 +57,6 @@ _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 class ServerKind(StrEnum):
     SLURM = 'slurm'
     PLAIN = 'plain'
-
-
-class EnvironmentKind(StrEnum):
-    CONDA = 'conda'
-    VENV = 'venv'
-    NONE = 'none'
-
-
-@dataclass(frozen=True)
-class EnvironmentConfig:
-    """Prepare a shell before sending payload."""
-
-    label: str
-    kind: EnvironmentKind | str = EnvironmentKind.NONE
-    name: str | None = None
-    conda_base: str | None = None
-    modules: tuple[str, ...] = ()
-    pre_activation: tuple[str, ...] = ()
-    post_activation: tuple[str, ...] = ()
-    env: dict[str, str] = field(default_factory=dict)
-    mpirun: str = 'mpirun'
-
-
-@dataclass(frozen=True)
-class ServerConfig:
-    """A remote resource, and the environments available on it."""
-
-    label: str
-    kind: ServerKind | str = ServerKind.SLURM
-    host: str | None = None
-    user: str | None = None
-    workdir: str = '~/.tether'
-    default_environment: str | None = None
-    timeout: float | None = None
-    """Seconds for remote commands; `None` falls back to `DEFAULT_TIMEOUT`."""
-    environments: dict[str, EnvironmentConfig] = field(default_factory=dict)
 
 
 # -- locations -------------------------------------------------------------
@@ -124,13 +89,18 @@ def list_servers(config_dir: str | Path | None = None) -> list[str]:
 # -- reading ---------------------------------------------------------------
 
 
-def load_server(
-    name: str, config_dir: str | Path | None = None
-) -> ServerConfig | None:
-    """One server's configuration, or `None` if it has none.
+def _load_server(name: str, config_dir: str | Path | None = None) -> dict | None:
+    """The validated body of `<name>.json`, or `None` if there is no such file.
 
-    `None` is not an error: an unconfigured name is treated as a hostname or an
-    `ssh_config` alias.
+    Private: the body is a raw dict whose `environments` values are live
+    objects, which is a shape only `Server` should have to know. Callers want
+    `tether.server(name)`.
+
+    A dict rather than an object: `Server` builds itself from this, and a
+    function here returning a `Server` would have to construct one to read one.
+
+    `None` is not an error -- an unconfigured name is treated as a hostname or
+    an `ssh_config` alias.
     """
     path = server_path(name, config_dir)
     if not path.exists():
@@ -147,86 +117,92 @@ def load_server(
         raise ConfigError(f'{path}: top level must be an object')
 
     raw.pop(VERSION_KEY, None)   # written by tether; not a configuration field
-    return _server(path, name, raw)
-
-
-def _server(path: Path, label: str, body: dict) -> ServerConfig:
     where = str(path)
-    _reject_unknown(where, body, ServerConfig, skip={'label'})
 
-    kind = body.get('kind', ServerKind.SLURM)
+    known = {'kind', 'host', 'user', 'workdir', 'default_environment',
+             'timeout', 'environments'}
+    unknown = set(raw) - known
+    if unknown:
+        raise ConfigError(
+            f'{where}: unknown key(s) {sorted(unknown)}; '
+            f'expected any of {sorted(known)}'
+        )
+
+    kind = raw.get('kind', ServerKind.SLURM)
     if kind not in ServerKind:
         raise ConfigError(
             f'{where}: kind must be one of {[k.value for k in ServerKind]}, '
             f'not {kind!r}'
         )
+    raw['kind'] = ServerKind(kind)
+    raw['timeout'] = _timeout(where, raw.get('timeout'))
 
-    raw_environments = body.get('environments', {})
+    raw_environments = raw.get('environments', {})
     if not isinstance(raw_environments, dict):
         raise ConfigError(f"{where}: 'environments' must be an object")
-    environments = {
-        name: _environment(where, name, env_body)
-        for name, env_body in raw_environments.items()
+    raw['environments'] = {
+        label: _environment(where, label, body)
+        for label, body in raw_environments.items()
     }
 
-    wanted = body.get('default_environment')
-    if wanted and wanted not in environments:
+    wanted = raw.get('default_environment')
+    if wanted and wanted not in raw['environments']:
         raise ConfigError(
             f"{where}: default_environment '{wanted}' is not among the "
-            f'environments defined here ({sorted(environments) or "none"})'
+            f'environments defined here ({sorted(raw["environments"]) or "none"})'
         )
+    return raw
 
-    return ServerConfig(
-        label=label,
-        kind=kind,
-        host=body.get('host', label),
-        user=body.get('user'),
-        workdir=body.get('workdir', '~/.tether'),
-        default_environment=wanted,
-        timeout=_timeout(where, body.get('timeout')),
-        environments=environments,
+
+def _save_server(
+    name: str,
+    body: dict,
+    *,
+    config_dir: str | Path | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Write `body` to `<name>.json`; return the path.
+
+    Private because it writes whatever it is handed. `Server.save()` builds the
+    body from a validated object; a public writer taking a raw dict would let
+    you produce a file that `_load_server` then refuses -- the round-trip hole
+    the environment classes exist to close.
+    """
+    # Deferred: `__init__` imports this module, so the version cannot be
+    # imported at module scope without a cycle.
+    from . import __version__
+
+    path = server_path(name, config_dir)
+    if path.exists() and not overwrite:
+        raise ConfigError(
+            f'{path} already exists; pass overwrite=True to replace it'
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({VERSION_KEY: __version__, **body}, indent=2, sort_keys=True)
+        + '\n'
     )
+    return path
 
 
-def _environment(where: str, label: str, body: dict) -> EnvironmentConfig:
-    where = f'{where}: environment {label!r}'
+def _environment(where: str, label: str, body: dict) -> Environment:
+    """Build one environment from its JSON body.
+
+    Validation lives in the classes, so this only has to pick the right one and
+    hand over the rest. `kind` is the discriminator and is consumed here, which
+    is why it is popped before the unknown-key check.
+    """
     if not isinstance(body, dict):
-        raise ConfigError(f'{where}: must be an object')
-    _reject_unknown(where, body, EnvironmentConfig, skip={'label'})
+        raise ConfigError(f'{where}: environment {label!r} must be an object')
 
-    kind = body.get('kind', EnvironmentKind.NONE)
-    if kind not in EnvironmentKind:
-        raise ConfigError(
-            f'{where}: kind must be one of {[k.value for k in EnvironmentKind]}, '
-            f'not {kind!r}'
-        )
-
-    name = body.get('name')
-    if kind in (EnvironmentKind.CONDA, EnvironmentKind.VENV) and not name:
-        raise ConfigError(f"{where}: kind '{kind}' requires 'name'")
-
-    conda_base = body.get('conda_base')
-    if conda_base and kind != EnvironmentKind.CONDA:
-        raise ConfigError(
-            f"{where}: 'conda_base' is only meaningful for kind 'conda', "
-            f'not {kind!r}'
-        )
-
-    env = body.get('env', {})
-    if not isinstance(env, dict):
-        raise ConfigError(f"{where}: 'env' must be an object of strings")
-
-    return EnvironmentConfig(
-        label=label,
-        kind=kind,
-        name=name,
-        conda_base=conda_base,
-        modules=tuple(body.get('modules', ())),
-        pre_activation=tuple(body.get('pre_activation', ())),
-        post_activation=tuple(body.get('post_activation', ())),
-        env={str(k): str(v) for k, v in env.items()},
-        mpirun=body.get('mpirun', 'mpirun'),
-    )
+    body = dict(body)
+    kind = body.pop('kind', EnvironmentKind.NONE)
+    try:
+        return env(label, kind, **body)
+    except ConfigError as exc:
+        raise ConfigError(f'{where}: {exc}') from None
+    except TypeError as exc:                       # wrong type for a field
+        raise ConfigError(f'{where}: environment {label!r}: {exc}') from None
 
 
 def _timeout(where: str, raw: object) -> float | None:
@@ -240,43 +216,6 @@ def _timeout(where: str, raw: object) -> float | None:
     return float(raw)
 
 
-def _reject_unknown(where: str, body: dict, cls: type, skip: set[str]) -> None:
-    """Typos in a config file should be loud, not silently ignored."""
-    known = {f for f in cls.__dataclass_fields__ if f not in skip}
-    unknown = set(body) - known
-    if unknown:
-        raise ConfigError(
-            f'{where}: unknown key(s) {sorted(unknown)}; '
-            f'expected any of {sorted(known)}'
-        )
-
-
-# -- writing ---------------------------------------------------------------
-
-
-def save_server(
-    cfg: ServerConfig,
-    *,
-    config_dir: str | Path | None = None,
-    overwrite: bool = False,
-) -> Path:
-    """Write `cfg` to `~/.tether/servers/<label>.json`; return the path."""
-    # Deferred: `__init__` imports this module, so the version cannot be
-    # imported at module scope without a cycle.
-    from . import __version__
-
-    path = server_path(cfg.label, config_dir)
-    if path.exists() and not overwrite:
-        raise ConfigError(
-            f'{path} already exists; pass overwrite=True to replace it'
-        )
-
-    body = {VERSION_KEY: __version__, **_body(cfg)}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(body, indent=2, sort_keys=True) + '\n')
-    return path
-
-
 def delete_server(name: str, *, config_dir: str | Path | None = None) -> bool:
     """Remove a saved server. `False` if there was nothing to remove."""
     path = server_path(name, config_dir)
@@ -284,26 +223,3 @@ def delete_server(name: str, *, config_dir: str | Path | None = None) -> bool:
         return False
     path.unlink()
     return True
-
-
-def _body(cfg: ServerConfig | EnvironmentConfig) -> dict:
-    """Dataclass to JSON body.
-
-    `label` is the filename (or the map key), and anything left at its default
-    is dropped, so a saved file shows what was actually chosen rather than a
-    transcript of every default in force on the day it was written.
-    """
-    default = type(cfg)(label=cfg.label)
-    body: dict = {}
-    for f in dataclasses.fields(cfg):
-        if f.name == 'label':
-            continue
-        value = getattr(cfg, f.name)
-        if f.name == 'environments':
-            if value:
-                body[f.name] = {name: _body(env) for name, env in value.items()}
-            continue
-        if value is None or value == getattr(default, f.name):
-            continue
-        body[f.name] = list(value) if isinstance(value, tuple) else value
-    return body
