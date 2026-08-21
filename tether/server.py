@@ -15,7 +15,13 @@ from typing import Any, Self
 
 from . import environment as _environment
 from . import slurm as _slurm
-from .config import EnvironmentConfig, EnvironmentKind, ServerConfig, ServerKind, load_config
+from .config import (
+    EnvironmentConfig,
+    EnvironmentKind,
+    ServerConfig,
+    ServerKind,
+    load_server,
+)
 from .errors import ConfigError, EnvActivationError, SlurmError
 from .slurm import Job, Partition
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
@@ -59,14 +65,25 @@ class EnvironmentInfo:
 
 
 class Server:
-    """A remote resource reachable over SSH.
+    """A remote compute resource: the object PHOEBE holds and passes around.
+
+    Despite the name, this is not merely a description of a host. One `Server`
+    composes everything needed to work with a resource:
+
+    - a `Link`, the single SSH connection, reconnected invisibly as needed;
+    - an `EnvironmentConfig`, the environment its commands run under;
+    - `workdir`, the remote scratch root that `path()` resolves against;
+    - `timeout`, the default deadline for its commands.
+
+    `SlurmServer` adds scheduler queries on top. If you are looking for where
+    the connection lives, it is here -- there is no separate session object.
 
     Connects lazily: constructing a `Server` performs no I/O and raises only on
     bad configuration. Call `connect()` to fail fast, or just use it.
 
     Resolution order for every field is explicit argument, then
-    `~/.tether/servers.toml`, then `~/.ssh/config` (handled by asyncssh). A
-    `name` that is absent from the config file is treated as a hostname or
+    `~/.tether/servers/<name>.json`, then `~/.ssh/config` (handled by
+    asyncssh). A `name` with no config file is treated as a hostname or
     `ssh_config` alias, so `Server("terra")` works with no tether config at all.
     Pass `ssh_config=` to read a specific ssh_config file rather than
     `~/.ssh/config`, exactly like `ssh -F`.
@@ -88,11 +105,11 @@ class Server:
         ssh_config: str | Path | None = None,
         config_dir: str | Path | None = None,
         timeout: float | None = None,
+        link: Link | None = None,
         keepalive: int = DEFAULT_KEEPALIVE,
         connect_timeout: float = 30.0,
     ) -> None:
-        config = load_config(config_dir)
-        cfg: ServerConfig | None = config.server(name) if name else None
+        cfg: ServerConfig | None = load_server(name, config_dir) if name else None
 
         self.label = name
         self.host = host or (cfg.host if cfg else name)
@@ -104,15 +121,24 @@ class Server:
         self.timeout = timeout or (cfg.timeout if cfg else None) or DEFAULT_TIMEOUT
 
         wanted = environment or (cfg.default_environment if cfg else None)
-        if wanted and wanted not in config.environments:
-            raise ConfigError(f"unknown environment '{wanted}'")
+        available = cfg.environments if cfg else {}
+        if wanted and wanted not in available:
+            raise ConfigError(
+                f"unknown environment '{wanted}' for server '{name}'; "
+                f'defined here: {sorted(available) or "none"}'
+            )
         self.environment: EnvironmentConfig | None = (
-            config.environments.get(wanted) if wanted else None
+            available.get(wanted) if wanted else None
         )
 
         self._username: str | None = None
         self._home: str | None = None
-        self._link = Link(
+
+        # An injected link governs the transport outright: `host`, `user`,
+        # `port` and `ssh_config` describe how a link *would* be built, and are
+        # ignored when one is supplied. This is the seam a local (non-SSH)
+        # transport plugs into for PHOEBE running on the login node.
+        self._link = link or Link(
             self.host,
             self.user,
             port=port,
@@ -389,7 +415,7 @@ def server(name: str | None = None, *, kind: ServerKind | str | None = None, **k
                 f'config_dir must be a str, Path or None, '
                 f'not {type(config_dir).__name__}'
             )
-        cfg = load_config(config_dir).server(name) if name else None
+        cfg = load_server(name, config_dir) if name else None
         kind = cfg.kind if cfg else ServerKind.SLURM
 
     try:

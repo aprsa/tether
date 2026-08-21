@@ -1,11 +1,21 @@
 """Unit tests for the parts of tether that need no cluster."""
 
+import json
+import pathlib
 from datetime import timedelta
 
 import pytest
 
 import tether
 from tether.slurm import parse_duration, parse_sinfo, parse_squeue
+
+
+def write_server(config_dir, name='a', **body):
+    """Write one server config the way tether will read it back."""
+    path = pathlib.Path(config_dir) / 'servers' / f'{name}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
 
 
 @pytest.mark.parametrize(
@@ -87,55 +97,65 @@ def test_sinfo_parses_and_computes_load():
     assert gpu.nodes_other == 1
 
 
-def test_config_missing_file_is_not_an_error(tmp_path):
-    cfg = tether.load_config(tmp_path)
-    assert cfg.servers == {} and cfg.environments == {}
+def test_no_config_is_not_an_error(tmp_path):
+    assert tether.load_server('anything', tmp_path) is None
+    assert tether.list_servers(tmp_path) == []
 
 
 def test_config_roundtrip(tmp_path):
-    (tmp_path / 'servers.toml').write_text(
-        """
-        [server.terra]
-        host = "terra.villanova.edu"
-        user = "andrej"
-        workdir = "~/.tether"
-        default_environment = "phoebe"
-
-        [server.laptop]
-        kind = "plain"
-
-        [environment.phoebe]
-        kind = "conda"
-        name = "phoebe-dev"
-        modules = ["openmpi/4.1.5"]
-        env = { OMP_NUM_THREADS = "1" }
-        """
+    write_server(
+        tmp_path,
+        'terra',
+        host='terra.villanova.edu',
+        user='andrej',
+        workdir='~/.tether',
+        default_environment='phoebe',
+        environments={
+            'phoebe': {
+                'kind': 'conda',
+                'name': 'phoebe-dev',
+                'modules': ['openmpi/4.1.5'],
+                'env': {'OMP_NUM_THREADS': '1'},
+            }
+        },
     )
-    cfg = tether.load_config(tmp_path)
+    write_server(tmp_path, 'laptop', kind='plain')
 
-    terra = cfg.server('terra')
+    terra = tether.load_server('terra', tmp_path)
     assert terra.host == 'terra.villanova.edu'
-    assert terra.kind == 'slurm'            # default
-    assert cfg.server('laptop').host == 'laptop'   # defaults to table key
-    assert cfg.environments['phoebe'].modules == ('openmpi/4.1.5',)
-    assert cfg.environments['phoebe'].env == {'OMP_NUM_THREADS': '1'}
+    assert terra.kind == 'slurm'                        # default
+    assert terra.environments['phoebe'].modules == ('openmpi/4.1.5',)
+    assert terra.environments['phoebe'].env == {'OMP_NUM_THREADS': '1'}
+
+    # The filename is the identity, and the host falls back to it.
+    assert tether.load_server('laptop', tmp_path).host == 'laptop'
+    assert tether.list_servers(tmp_path) == ['laptop', 'terra']
 
 
 @pytest.mark.parametrize(
     'body,fragment',
     [
-        ('[server.a]\nhostt = "x"', 'unknown key'),
-        ('[server.a]\nkind = "pbs"', 'kind must be one of'),
-        ('[server.a]\ndefault_environment = "nope"', 'unknown environment'),
-        ('[environment.e]\nkind = "conda"', "requires 'name'"),
-        ('[server.a\n', 'servers.toml'),
+        ({'hostt': 'x'}, 'unknown key'),
+        ({'kind': 'pbs'}, 'kind must be one of'),
+        ({'default_environment': 'nope'}, 'not among the environments'),
+        ({'environments': {'e': {'kind': 'conda'}}}, "requires 'name'"),
+        ({'environments': {'e': {'kind': 'venv', 'name': 'v',
+                                 'conda_base': '/c'}}}, 'only meaningful for'),
+        ({'environments': []}, 'must be an object'),
     ],
 )
 def test_config_errors_are_loud(tmp_path, body, fragment):
-    (tmp_path / 'servers.toml').write_text(body)
+    write_server(tmp_path, 'a', **body)
     with pytest.raises(tether.ConfigError) as exc:
-        tether.load_config(tmp_path)
+        tether.load_server('a', tmp_path)
     assert fragment in str(exc.value)
+
+
+def test_malformed_json_names_the_file(tmp_path):
+    path = write_server(tmp_path, 'a')
+    path.write_text('{not json')
+    with pytest.raises(tether.ConfigError, match='a.json'):
+        tether.load_server('a', tmp_path)
 
 
 def test_server_needs_a_host(tmp_path):
@@ -176,18 +196,102 @@ def test_timeout_defaults_to_a_generous_value(tmp_path):
 
 
 def test_timeout_comes_from_the_config_file(tmp_path):
-    (tmp_path / 'servers.toml').write_text('[server.a]\ntimeout = 120\n')
-    assert tether.load_config(tmp_path).server('a').timeout == 120.0
+    write_server(tmp_path, 'a', timeout=120)
+    assert tether.load_server('a', tmp_path).timeout == 120.0
     assert tether.server('a', config_dir=tmp_path).timeout == 120.0
 
 
 def test_explicit_timeout_beats_the_config_file(tmp_path):
-    (tmp_path / 'servers.toml').write_text('[server.a]\ntimeout = 120\n')
+    write_server(tmp_path, 'a', timeout=120)
     assert tether.server('a', config_dir=tmp_path, timeout=5).timeout == 5.0
 
 
-@pytest.mark.parametrize('bad', ['"soon"', '0', '-1', 'true'])
+@pytest.mark.parametrize('bad', ['soon', 0, -1, True])
 def test_nonsense_timeouts_are_loud(tmp_path, bad):
-    (tmp_path / 'servers.toml').write_text(f'[server.a]\ntimeout = {bad}\n')
+    write_server(tmp_path, 'a', timeout=bad)
     with pytest.raises(tether.ConfigError, match='timeout must be'):
-        tether.load_config(tmp_path)
+        tether.load_server('a', tmp_path)
+
+
+# -- link injection --------------------------------------------------------
+
+
+def test_an_injected_link_is_used_as_is(tmp_path):
+    """The seam a local (non-SSH) transport will plug into."""
+    mine = tether.Link('elsewhere.invalid', 'someone')
+    srv = tether.server('nowhere.invalid', config_dir=tmp_path, link=mine)
+    assert srv.link is mine
+    assert not srv.connected          # still lazy; nothing opened
+
+
+def test_without_injection_a_link_is_built_from_the_config(tmp_path):
+    write_server(tmp_path, 'a', host='a.invalid', user='kelly')
+    srv = tether.server('a', config_dir=tmp_path)
+    assert srv.link.host == 'a.invalid'
+    assert srv.link.user == 'kelly'
+
+
+# -- writing config --------------------------------------------------------
+
+
+def test_save_then_load_round_trips(tmp_path):
+    cfg = tether.ServerConfig(
+        label='terra',
+        host='terra.villanova.edu',
+        user='andrej',
+        timeout=120.0,
+        default_environment='phoebe',
+        environments={
+            'phoebe': tether.EnvironmentConfig(
+                label='phoebe',
+                kind='conda',
+                name='phoebe',
+                conda_base='/opt/conda',
+                pre_activation=('source "$HOME/hook.sh"',),   # quotes must survive
+                env={'OMP_NUM_THREADS': '1'},
+            )
+        },
+    )
+    path = tether.save_server(cfg, config_dir=tmp_path)
+    assert path == tmp_path / 'servers' / 'terra.json'
+
+    back = tether.load_server('terra', tmp_path)
+    assert back == cfg
+
+
+def test_saved_files_omit_defaults(tmp_path):
+    """A saved file should show what was chosen, not a transcript of every
+    default in force the day it was written."""
+    tether.save_server(tether.ServerConfig(label='a', host='a.invalid'),
+                       config_dir=tmp_path)
+    body = json.loads((tmp_path / 'servers' / 'a.json').read_text())
+    assert body['host'] == 'a.invalid'
+    assert body['tether'] == tether.__version__
+    for defaulted in ('kind', 'workdir', 'timeout', 'user', 'environments'):
+        assert defaulted not in body
+
+
+def test_save_refuses_to_clobber(tmp_path):
+    cfg = tether.ServerConfig(label='a', host='one.invalid')
+    tether.save_server(cfg, config_dir=tmp_path)
+    with pytest.raises(tether.ConfigError, match='already exists'):
+        tether.save_server(cfg, config_dir=tmp_path)
+
+    tether.save_server(tether.ServerConfig(label='a', host='two.invalid'),
+                       config_dir=tmp_path, overwrite=True)
+    assert tether.load_server('a', tmp_path).host == 'two.invalid'
+
+
+def test_delete_server(tmp_path):
+    tether.save_server(tether.ServerConfig(label='a'), config_dir=tmp_path)
+    assert tether.list_servers(tmp_path) == ['a']
+    assert tether.delete_server('a', config_dir=tmp_path) is True
+    assert tether.list_servers(tmp_path) == []
+    assert tether.delete_server('a', config_dir=tmp_path) is False
+
+
+@pytest.mark.parametrize('bad', ['../escape', 'a/b', '.', '..', '', 'has space'])
+def test_names_that_would_escape_the_directory_are_refused(bad, tmp_path):
+    """The name becomes a filename, so traversal has to be impossible."""
+    with pytest.raises(tether.ConfigError, match='not a usable server name'):
+        tether.server_path(bad, tmp_path)

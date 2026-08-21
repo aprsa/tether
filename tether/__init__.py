@@ -18,7 +18,17 @@ sessions.
 """
 
 from . import environment
-from .config import Config, EnvironmentConfig, ServerConfig, ServerKind, EnvironmentKind, load_config
+from .config import (
+    EnvironmentConfig,
+    EnvironmentKind,
+    ServerConfig,
+    ServerKind,
+    delete_server,
+    load_server,
+    save_server,
+    server_path,
+    list_servers,
+)
 from .errors import (
     EnvActivationError,
     ConfigError,
@@ -35,7 +45,6 @@ __version__ = '0.1.0'
 
 __all__ = [
     'EnvActivationError',
-    'Config',
     'ConfigError',
     'EnvironmentConfig',
     'EnvironmentInfo',
@@ -54,7 +63,11 @@ __all__ = [
     'Link',
     'LinkError',
     'environment',
-    'load_config',
+    'delete_server',
+    'load_server',
+    'save_server',
+    'server_path',
+    'list_servers',
     'parse_duration',
     'server',
     '__version__',

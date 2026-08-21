@@ -61,31 +61,51 @@ touching `~/.ssh`.
 
 ## Configuration
 
-Optional, in `~/.tether/servers.toml`:
+Optional, one JSON file per server in `~/.tether/servers/`:
 
-```toml
-[server.terra]
-kind    = "slurm"                  # slurm | plain   (default: slurm)
-host    = "terra.villanova.edu"
-user    = "andrej"
-workdir = "~/.tether"             # remote scratch root; ~ resolved on use
-timeout = 3600                     # seconds per command (default: 3600)
-default_environment = "phoebe"
-
-[environment.phoebe]
-kind            = "conda"          # conda | venv | none
-name            = "phoebe-dev"     # conda env name, or venv path
-conda_base      = "/opt/conda"     # conda only; source its hook directly
-modules         = ["openmpi/4.1.6"]
-pre_activation  = []               # raw shell lines, run first
-post_activation = []               # raw shell lines, run last
-env             = { OMP_NUM_THREADS = "1" }
-mpirun          = "mpirun"
+```json
+// ~/.tether/servers/terra.json
+{
+  "tether": "0.1.0",
+  "kind": "slurm",
+  "host": "terra.villanova.edu",
+  "user": "andrej",
+  "workdir": "~/.tether",
+  "default_environment": "phoebe",
+  "environments": {
+    "phoebe": {
+      "kind": "conda",
+      "name": "phoebe",
+      "conda_base": "/opt/conda",
+      "env": {"OMP_NUM_THREADS": "1"}
+    }
+  }
+}
 ```
 
-Servers and environments are sibling tables, not nested, so one environment
-definition is reusable across servers. Unknown keys are a hard error — a typo
-in a config file should be loud.
+The filename **is** the server's name, so renaming a server is a `mv`, and
+`Server("terra")` reads one file rather than all of them. Unknown keys are a
+hard error — a typo in a config file should be loud.
+
+**Environments are nested inside their server, not shared between servers.**
+In practice they do not generalise: `modules`, `pre_activation` and
+`conda_base` each encode one cluster's assumptions, and only `kind` and `name`
+travel. Nesting also makes it impossible to point a server at an environment
+meant for a different machine.
+
+**JSON rather than TOML** because tether writes these files as well as reading
+them, and the standard library can only *read* TOML. That keeps the runtime
+dependency list at one.
+
+```python
+tether.save_server(cfg)            # -> ~/.tether/servers/terra.json
+tether.load_server("terra")        # -> ServerConfig | None
+tether.servers()                   # -> ["terra", ...]
+tether.delete_server("terra")
+```
+
+Saving omits anything left at its default, so a file records what was actually
+chosen rather than every default in force the day it was written.
 
 ## Environments
 
@@ -105,8 +125,8 @@ normally a shell *function* sourced from `/etc/profile.d`, and `conda activate`
 needs its hook sourced, so a non-interactive shell often cannot run either until
 something makes them available. That is what this slot is for:
 
-```toml
-pre_activation = ["source /etc/profile.d/modules.sh"]
+```json
+"pre_activation": ["source /etc/profile.d/modules.sh"]
 ```
 
 Both verbatim slots run *before* the payload; they differ only in which side of
@@ -163,7 +183,7 @@ raises but leaves the remote process running and the channel open; tether wraps
 default is deliberately generous (3600s) because installing conda or compiling a
 package remotely takes minutes, and a timeout that interrupts real work is worse
 than one that lets a wedged command hang; set `timeout` per server in
-`servers.toml`, per call, or `None` for no limit. Transfers are untimed by
+its config file, per call, or `None` for no limit. Transfers are untimed by
 default — a multi-GB `put` legitimately exceeds any of this.
 
 **Remote paths are resolved, not quoted.** `Server.path()` builds absolute paths

@@ -5,6 +5,8 @@ a batch script someone will read by hand while debugging, so the tests assert on
 the emitted shell rather than on internal structure.
 """
 
+import json
+import pathlib
 import shlex
 import subprocess
 
@@ -13,6 +15,14 @@ import pytest
 import tether
 from tether.config import EnvironmentConfig, EnvironmentKind
 from tether.environment import create_preamble, remote_path, wrap
+
+
+def write_server(config_dir, name='x', **body):
+    """Write one server config the way tether will read it back."""
+    path = pathlib.Path(config_dir) / 'servers' / f'{name}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
 
 
 def env(**kwargs) -> EnvironmentConfig:
@@ -273,17 +283,16 @@ def test_wrap_without_a_preamble_is_the_bare_command():
 
 
 def test_config_reads_the_new_keys(tmp_path):
-    (tmp_path / 'servers.toml').write_text(
-        """
-        [environment.phoebe]
-        kind            = "conda"
-        name            = "phoebe-dev"
-        conda_base      = "/opt/conda"
-        pre_activation  = ["source /etc/profile.d/modules.sh"]
-        post_activation = ["echo late"]
-        """
-    )
-    cfg = tether.load_config(tmp_path).environments['phoebe']
+    write_server(tmp_path, 'x', environments={
+        'phoebe': {
+            'kind': 'conda',
+            'name': 'phoebe-dev',
+            'conda_base': '/opt/conda',
+            'pre_activation': ['source /etc/profile.d/modules.sh'],
+            'post_activation': ['echo late'],
+        }
+    })
+    cfg = tether.load_server('x', tmp_path).environments['phoebe']
     assert cfg.conda_base == '/opt/conda'
     assert cfg.pre_activation == ('source /etc/profile.d/modules.sh',)
     assert cfg.post_activation == ('echo late',)
@@ -293,35 +302,27 @@ def test_superseded_key_names_are_rejected_not_ignored(tmp_path):
     """`bootstrap` and `prelude` were the earlier names for the two verbatim
     slots. `_reject_unknown` derives the allowed keys from
     `__dataclass_fields__`, so an old config fails loudly instead of silently
-    dropping the lines it asked for -- and TOML keys can never drift from the
+    dropping the lines it asked for -- and JSON keys can never drift from the
     field names."""
     for superseded in ('bootstrap', 'prelude'):
-        (tmp_path / 'servers.toml').write_text(
-            f'[environment.e]\n{superseded} = ["echo hi"]\n'
-        )
+        write_server(tmp_path, 'x',
+                     environments={'e': {superseded: ['echo hi']}})
         with pytest.raises(tether.ConfigError, match='unknown key'):
-            tether.load_config(tmp_path)
+            tether.load_server('x', tmp_path)
 
 
 def test_conda_base_on_a_non_conda_environment_is_loud(tmp_path):
-    (tmp_path / 'servers.toml').write_text(
-        '[environment.e]\nkind = "venv"\nname = "/opt/v"\nconda_base = "/opt/conda"\n'
-    )
+    write_server(tmp_path, 'x', environments={
+        'e': {'kind': 'venv', 'name': '/opt/v', 'conda_base': '/opt/conda'}
+    })
     with pytest.raises(tether.ConfigError, match='only meaningful for'):
-        tether.load_config(tmp_path)
+        tether.load_server('x', tmp_path)
 
 
 def test_server_exposes_the_preamble(tmp_path):
-    (tmp_path / 'servers.toml').write_text(
-        """
-        [server.x]
-        default_environment = "e"
-
-        [environment.e]
-        kind = "venv"
-        name = "~/venvs/phoebe"
-        """
-    )
+    write_server(tmp_path, 'x',
+                 default_environment='e',
+                 environments={'e': {'kind': 'venv', 'name': '~/venvs/phoebe'}})
     srv = tether.server('x', config_dir=tmp_path)
     assert 'source "$HOME/venvs/phoebe/bin/activate"' in srv.preamble
 
