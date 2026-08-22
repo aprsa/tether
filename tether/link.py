@@ -14,9 +14,10 @@ Two design points worth stating, because everything above depends on them:
    connection is discarded, re-established, and the operation retried exactly
    once. A second failure is raised.
 
-`keepalive_interval` is set, but note its scope: it only fires while the event
-loop is running, so it protects long single operations (a large transfer, a
-streamed log) rather than long idle periods. Idle drops are handled by (2).
+`keepalive_interval` now does what it says: the loop runs continuously on its
+own thread (see `event_loop.py`), so probes fire during idle periods too, not
+only for the duration of a call. Reconnect-and-retry-once remains the backstop
+for drops the keepalive does not catch.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import asyncio
 import os
 import posixpath
 import time
+import weakref
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +34,8 @@ from typing import Any, Self
 
 import asyncssh
 
-from .errors import RemoteCommandError, TetherError, LinkError
+from .event_loop import LoopThread
+from .errors import RemoteCommandError, LinkError
 
 DEFAULT_TIMEOUT = 3600.0
 # In seconds. Applies to commands, not transfers. Override per call,
@@ -40,7 +43,8 @@ DEFAULT_TIMEOUT = 3600.0
 # at all.
 
 DEFAULT_KEEPALIVE = 30
-# Seconds between keepalive probes while the loop is running.
+# Seconds between keepalive probes. The loop runs continuously, so these
+# fire during idle periods too.
 
 _RETRYABLE = (
     asyncssh.ConnectionLost,
@@ -56,6 +60,28 @@ _CONNECT_FAILED = (
     OSError,
     TimeoutError,
 )
+
+
+class _Teardown:
+    """What has to happen when a `Link` is abandoned rather than closed.
+
+    Deliberately holds no reference back to the `Link`: a finalizer that did
+    would keep its object alive forever, which is the opposite of the point.
+    The connection lives here so the finalizer can still see the current one.
+    """
+
+    def __init__(self, loop: LoopThread) -> None:
+        self.loop = loop
+        self.conn: asyncssh.SSHClientConnection | None = None
+
+    def __call__(self) -> None:
+        if self.conn is not None:
+            # abort(), not a graceful close: there is no one left to await a
+            # clean disconnect, and an abandoned session on a shared login node
+            # is worse than an abrupt one.
+            self.loop.call_soon(self.conn.abort)
+            self.conn = None
+        self.loop.stop()
 
 
 @dataclass(frozen=True)
@@ -81,8 +107,10 @@ class Result:
 class Link:
     """A reusable SSH connection to one host.
 
-    Connects lazily on first use. Not thread-safe and not usable from inside a
-    running event loop: it owns its own loop and drives it synchronously.
+    Connects lazily on first use. Its event loop runs on a thread of its own
+    (see `event_loop.py`), so the synchronous API works from a script, a
+    notebook, or inside someone else's async application alike. Not thread-safe
+    for *callers*: one `Link` expects one caller at a time.
 
     `ssh_config` names an ssh_config file to read *instead of* `~/.ssh/config`,
     exactly like `ssh -F`. It is not a security relaxation: host keys are still
@@ -108,24 +136,55 @@ class Link:
         self.keepalive = keepalive
         self.connect_timeout = connect_timeout
 
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._conn: asyncssh.SSHClientConnection | None = None
+        self._loop = LoopThread(name=f'tether-loop-{host}')
         self._sftp: asyncssh.SFTPClient | None = None
+
+        # Rebinding a variable is the most ordinary thing in a notebook, and an
+        # abandoned Link would otherwise keep both a thread and a live SSH
+        # session until the kernel died. A safety net, not a substitute for
+        # close(): collection is prompt in CPython but not guaranteed.
+        #
+        # `atexit` is switched off deliberately: at interpreter shutdown the
+        # daemon thread is already going away and the OS reclaims the socket,
+        # so running this then risks hanging for no benefit. (It is an
+        # attribute on the finalizer -- passing it to the constructor forwards
+        # it to the callback instead.)
+        self._teardown = _Teardown(self._loop)
+        finalizer = weakref.finalize(self, self._teardown)
+        finalizer.atexit = False
+
+    @property
+    def _conn(self) -> asyncssh.SSHClientConnection | None:
+        """Stored on `_Teardown` so the finalizer sees the current connection.
+
+        A property rather than a plain attribute purely to keep one copy of it;
+        every `self._conn = ...` below reads naturally and still works.
+        """
+        return self._teardown.conn
+
+    @_conn.setter
+    def _conn(self, conn: asyncssh.SSHClientConnection | None) -> None:
+        self._teardown.conn = conn
 
     @property
     def connected(self) -> bool:
         return self._conn is not None
 
     def connect(self) -> Self:
-        """Establish the connection now instead of on first use."""
+        """Establish the connection now instead of on first use.
+
+        `close()` is the counterpart: it drops the connection and stops the
+        loop thread, and the object stays usable -- a later call reconnects.
+        """
         self._call(self._noop)
         return self
 
     def close(self) -> None:
-        """Close the connection and release the event loop.
+        """Close the connection and stop the event loop thread.
 
         Shuts the SFTP client and connection down in order, so no asyncio tasks
-        are orphaned. The object remains usable; a later call reconnects.
+        are orphaned, then joins the thread. The object remains usable; a later
+        call starts a fresh thread and reconnects.
         """
         if self._conn is not None:
             try:
@@ -135,14 +194,7 @@ class Link:
 
         self._conn = None
         self._sftp = None
-
-        if self._loop is not None and not self._loop.is_closed():
-            try:
-                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
-            except Exception:  # noqa: BLE001
-                pass
-            self._loop.close()
-        self._loop = None
+        self._loop.stop()
 
     def __enter__(self) -> Self:
         return self.connect()
@@ -324,37 +376,39 @@ class Link:
         awaited twice, and the retry needs a fresh one.
         """
         try:
-            return self._sync(factory())
-        except _RETRYABLE:
-            self._discard()
+            try:
+                return self._sync(factory())
+            except _RETRYABLE:
+                self._discard()
 
-        try:
-            return self._sync(factory())
-        except _RETRYABLE as exc:
-            self._discard()
-            # Not necessarily a lost link: a ChannelOpenError also covers a
-            # permanent refusal (missing sftp subsystem, MaxSessions reached).
-            # Report what happened rather than guessing why.
-            raise LinkError(
-                f'{self.host}: operation failed after one reconnect '
-                f'attempt: {type(exc).__name__}: {exc}'
-            ) from exc
+            try:
+                return self._sync(factory())
+            except _RETRYABLE as exc:
+                self._discard()
+                # Not necessarily a lost link: a ChannelOpenError also covers a
+                # permanent refusal (missing sftp subsystem, MaxSessions
+                # reached). Report what happened rather than guessing why.
+                raise LinkError(
+                    f'{self.host}: operation failed after one reconnect '
+                    f'attempt: {type(exc).__name__}: {exc}'
+                ) from exc
+        except BaseException:
+            # Nothing connected, so the loop thread has nothing left to serve.
+            # Without this a failed connect() leaves a thread behind, and code
+            # that retries several unreachable hosts accumulates one each time.
+            if self._conn is None:
+                self._loop.stop()
+            raise
 
     def _sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            coro.close()
-            raise TetherError(
-                "tether's synchronous API cannot be called from inside a "
-                "running event loop; await the coroutines directly instead."
-            )
+        """Hand a coroutine to the loop thread and wait for it.
 
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-        return self._loop.run_until_complete(coro)
+        No check for a running loop in the caller: that is the whole point of
+        owning a thread. tether works from a script, a notebook, or inside
+        someone else's async application -- though in the last case it blocks
+        that application until the call returns.
+        """
+        return self._loop.submit(coro)
 
     def _discard(self) -> None:
         """Forget the connection without assuming it is still usable."""

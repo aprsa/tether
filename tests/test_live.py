@@ -199,6 +199,59 @@ def test_bad_host_raises_link_error(rig):
         s.connect()
 
 
+def test_usable_from_inside_a_running_event_loop(rig):
+    """The Jupyter case: a kernel cell already runs inside a loop, and
+    `run_until_complete` cannot nest in one. Before the loop moved onto its own
+    thread, every tether call raised here."""
+    import asyncio
+
+    async def cell():
+        s = tether.SlurmServer(ALIAS, ssh_config=rig)
+        try:
+            s.connect()
+            return s.run('echo from-a-cell', check=True).stdout.strip()
+        finally:
+            s.close()
+
+    assert asyncio.run(cell()) == 'from-a-cell'
+
+
+def test_an_abandoned_server_is_reclaimed(rig):
+    """Rebinding a variable is the most ordinary thing in a notebook. Without
+    a finalizer each abandoned Server keeps a thread and a live SSH session
+    until the kernel dies."""
+    import gc
+    import threading
+
+    before = threading.active_count()
+    srv = tether.SlurmServer(ALIAS, ssh_config=rig)
+    srv.connect()
+    assert threading.active_count() > before
+
+    srv = None            # what re-running a cell does
+    gc.collect()
+    assert threading.active_count() == before
+
+
+def test_close_is_idempotent(rig):
+    s = tether.SlurmServer(ALIAS, ssh_config=rig)
+    s.connect()
+    s.close()
+    s.close()             # must not raise, nor wait on a thread already joined
+    assert not s.connected
+
+
+def test_the_loop_thread_is_cleaned_up_on_close(rig):
+    import threading
+
+    before = threading.active_count()
+    s = tether.SlurmServer(ALIAS, ssh_config=rig)
+    s.connect()
+    assert threading.active_count() > before
+    s.close()
+    assert threading.active_count() == before
+
+
 # -- phase 0: paths and transfers ----------------------------------------
 
 

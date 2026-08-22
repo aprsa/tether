@@ -27,6 +27,7 @@ is **make reconnection invisible**.
 
 | Layer | Module | Knows about |
 |---|---|---|
+| 0 | `event_loop.py` | The sync/async boundary. Knows nothing about SSH |
 | 1 | `link.py` | SSH only: `run`, `put`, `get`, reconnect, timeouts |
 | 2 | `slurm.py` | Slurm formats and parsers. Pure — no I/O, unit-testable |
 | 2 | `environment.py` | Shell activation lines. Pure — no I/O, unit-testable |
@@ -208,9 +209,18 @@ This is what keeps sshd's `MaxStartups` (and fail2ban) out of the picture.
 The SFTP client is held open for the same reason — each one spawns a subsystem
 channel and an `sftp-server` process remotely.
 
-**Keepalive's real scope.** `keepalive_interval=30` only fires while the event
-loop is running, so it protects long single operations, not long idle periods.
-Idle drops are handled by reconnect-and-retry-once instead.
+**The event loop runs on its own thread.** tether is synchronous; asyncssh is
+not. Rather than driving a loop in place with `run_until_complete` — which
+cannot nest, so every call raised inside a Jupyter kernel — each `Link` owns a
+loop on a thread and hands work to it. That makes the synchronous API work from
+a script, a notebook, or inside someone else's async application, and it is
+also what will let a held-open channel make progress *between* calls when
+completion notification lands. The cost: a call from inside an async context
+blocks that context until it returns.
+
+**Keepalive therefore means what it says.** With the loop running continuously,
+`keepalive_interval=30` fires during idle periods, not only for the duration of
+a call. Reconnect-and-retry-once is the backstop for drops it does not catch.
 
 **Timeouts terminate the remote process.** `conn.run(timeout=...)` in asyncssh
 raises but leaves the remote process running and the channel open; tether wraps
@@ -235,9 +245,15 @@ else's machine. Failures carry a hint pointing at `~/.ssh/known_hosts`.
 **No global state.** Each `Server` owns one connection and one event loop; there
 is no shared registry. Construct one and pass it around.
 
-**Lazy connect.** Constructing a `Server` performs no I/O and raises only on bad
-configuration, so PHOEBE can build them during setup. Call `connect()` to fail
-fast.
+**Lazy connect, and `close()` is its counterpart.** Constructing a `Server`
+performs no network I/O and raises only on bad configuration, so PHOEBE can
+build them during setup. `connect()` fails fast; `close()` drops the connection
+and stops the loop thread, leaving the object usable — a later call reconnects.
+There is no separate `disconnect()`, because that is what `close()` already is.
+
+An abandoned `Server` is reclaimed on garbage collection, which matters in a
+notebook where re-running a cell rebinds the variable and orphans the previous
+one. That is a safety net, not a substitute for `close()`.
 
 **Slurm's absence is a hard error.** If you name a `SlurmServer`, tether trusts
 you: `sinfo --version` is probed once per connection and a failure raises
