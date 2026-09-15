@@ -13,13 +13,9 @@ import subprocess
 import pytest
 
 import tether
-from tether.environment import (
-    EnvironmentKind,
-    create_preamble,
-    remote_path,
-    wrap,
-)
+from tether.environment import EnvironmentKind, preamble, with_preamble
 from tether.environment import env as make_env
+from tether.shell import remote_path
 
 
 def write_server(config_dir, name='x', **body):
@@ -45,7 +41,7 @@ def preamble_lines(cfg) -> list[str]:
     over two of them. No config below does that, and the ones that do
     (`HOSTILE`) assert on the whole string instead.
     """
-    return create_preamble(cfg).splitlines()
+    return preamble(cfg).splitlines()
 
 
 # -- ordering -------------------------------------------------------------
@@ -56,13 +52,13 @@ def test_slots_appear_in_documented_order():
         kind=EnvironmentKind.VENV,
         path='/opt/venv',
         modules=('openmpi/4.1.5',),
-        pre_activation=('source /etc/profile.d/modules.sh',),
-        post_activation=('export PYTHONPATH=/late',),
+        pre_activation_cmds=('source /etc/profile.d/modules.sh',),
+        post_activation_cmds=('export PYTHONPATH=/late',),
         env={'OMP_NUM_THREADS': '1'},
     )
     got = preamble_lines(cfg)
 
-    # pre_activation first, post_activation last, activation between the two.
+    # pre_activation_cmds first, post_activation_cmds last, activation between the two.
     assert got[0] == 'source /etc/profile.d/modules.sh'
     assert got[-1] == 'export PYTHONPATH=/late'
 
@@ -92,26 +88,26 @@ def test_env_exports_precede_activation():
 
 def test_bare_metal_has_no_activation():
     cfg = env(kind=EnvironmentKind.NONE, modules=('gcc',), env={'X': '1'})
-    got = create_preamble(cfg)
+    got = preamble(cfg)
     assert 'activate' not in got
     assert 'module load gcc' in got
     assert 'export X=1' in got
 
 
 def test_no_environment_at_all_is_empty():
-    assert create_preamble(None) == ''
-    assert wrap(None, 'python run.py') == 'python run.py'
+    assert preamble(None) == ''
+    assert with_preamble(None, 'python run.py') == 'python run.py'
 
 
 def test_venv_sources_the_activate_script():
     cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv')
-    assert 'source /opt/venv/bin/activate' in create_preamble(cfg)
+    assert 'source /opt/venv/bin/activate' in preamble(cfg)
 
 
 def test_venv_tolerates_a_trailing_slash():
     cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv/')
-    assert '/opt/venv/bin/activate' in create_preamble(cfg)
-    assert '//bin' not in create_preamble(cfg)
+    assert '/opt/venv/bin/activate' in preamble(cfg)
+    assert '//bin' not in preamble(cfg)
 
 
 def test_conda_checks_for_conda_then_sources_the_hook_then_activates():
@@ -137,7 +133,7 @@ def test_conda_env_defaults_to_the_environment_name():
     """For conda the two are usually the same word, so saying it twice is
     noise. A venv `path` is a path, so it is never guessed -- see below."""
     assert env(kind=EnvironmentKind.CONDA).conda_env == 'test'
-    assert 'conda activate test' in create_preamble(env(kind=EnvironmentKind.CONDA))
+    assert 'conda activate test' in preamble(env(kind=EnvironmentKind.CONDA))
 
 
 def test_venv_without_a_path_is_refused_at_construction():
@@ -181,40 +177,18 @@ def test_every_fallible_step_is_guarded(cfg):
 # -- quoting and injection ------------------------------------------------
 
 
-def test_tilde_becomes_home_because_quoting_defeats_expansion():
-    # shlex.quote('~/x') -> "'~/x'", and the quotes stop the shell expanding ~.
-    assert remote_path('~/envs/phoebe') == '"$HOME/envs/phoebe"'
-    assert remote_path('~') == '"$HOME"'
-
-
-def test_absolute_and_relative_paths_are_quoted_normally():
-    assert remote_path('/opt/venv') == '/opt/venv'
-    assert remote_path('/opt/my venv') == "'/opt/my venv'"
-
-
-def test_tilde_user_is_quoted_rather_than_mangled():
-    """`~kelly` has no $HOME equivalent; quote it and fail loudly."""
-    assert remote_path('~kelly/env') == "'~kelly/env'"
-
-
-def test_double_quote_context_is_escaped():
-    """Inside "$HOME/...", these four characters keep their meaning."""
-    got = remote_path('~/a"b$c`d\\e')
-    assert got == '"$HOME/a\\"b\\$c\\`d\\\\e"'
-
-
 HOSTILE = ['x; rm -rf /', 'x$(whoami)', 'x`id`', "x'y", 'x&&y', 'x|y', 'x\nrm -rf /']
 
 
 @pytest.mark.parametrize('hostile', HOSTILE)
 def test_venv_path_stays_one_quoted_word(hostile):
-    got = create_preamble(env(kind=EnvironmentKind.VENV, path=hostile))
+    got = preamble(env(kind=EnvironmentKind.VENV, path=hostile))
     assert f'source {remote_path(hostile.rstrip("/") + "/bin/activate")}' in got
 
 
 @pytest.mark.parametrize('hostile', HOSTILE)
 def test_env_values_are_quoted(hostile):
-    got = create_preamble(env(env={'VAR': hostile}))
+    got = preamble(env(env={'VAR': hostile}))
     assert got == f'export VAR={shlex.quote(hostile)}'
 
 
@@ -225,7 +199,7 @@ def test_env_values_are_quoted(hostile):
 def test_hostile_venv_path_cannot_execute(tmp_path, template):
     canary = tmp_path / 'canary'
     canary.write_text('alive')
-    script = create_preamble(env(kind=EnvironmentKind.VENV, path=template.format(canary=canary)))
+    script = preamble(env(kind=EnvironmentKind.VENV, path=template.format(canary=canary)))
 
     # check=False: a nonzero exit is the expected outcome here.
     done = subprocess.run(
@@ -241,7 +215,7 @@ def test_hostile_env_value_round_trips_without_executing(tmp_path):
     canary = tmp_path / 'canary'
     canary.write_text('alive')
     hostile = f'; rm -f {canary}'
-    script = create_preamble(env(env={'VAR': hostile}))
+    script = preamble(env(env={'VAR': hostile}))
 
     done = subprocess.run(
         ['bash', '-c', f'{script}\nprintf %s "$VAR"'],
@@ -259,11 +233,11 @@ def test_hostile_env_value_round_trips_without_executing(tmp_path):
 )
 def test_env_names_must_be_shell_identifiers(bad):
     with pytest.raises(tether.ConfigError, match='not a usable shell variable'):
-        create_preamble(env(env={bad: '1'}))
+        preamble(env(env={bad: '1'}))
 
 
 def test_module_names_are_quoted():
-    got = create_preamble(env(modules=('openmpi/4.1.5', 'a b')))
+    got = preamble(env(modules=('openmpi/4.1.5', 'a b')))
     assert 'module load openmpi/4.1.5' in got
     assert "module load 'a b'" in got
 
@@ -271,26 +245,26 @@ def test_module_names_are_quoted():
 def test_verbatim_slots_are_not_quoted():
     """The two verbatim slots are raw shell on purpose -- that is their whole job."""
     cfg = env(
-        pre_activation=('export PATH="$PATH:/opt/bin"',),
-        post_activation=('cd "$SLURM_SUBMIT_DIR"',),
+        pre_activation_cmds=('export PATH="$PATH:/opt/bin"',),
+        post_activation_cmds=('cd "$SLURM_SUBMIT_DIR"',),
     )
-    got = create_preamble(cfg)
+    got = preamble(cfg)
     assert 'export PATH="$PATH:/opt/bin"' in got
     assert 'cd "$SLURM_SUBMIT_DIR"' in got
 
 
-# -- wrap -----------------------------------------------------------------
+# -- with_preamble -----------------------------------------------------------------
 
 
 def test_wrap_puts_the_command_last():
     cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv')
-    got = wrap(cfg, 'python run.py')
+    got = with_preamble(cfg, 'python run.py')
     assert got.endswith('\npython run.py')
     assert got.startswith('source /opt/venv/bin/activate')
 
 
 def test_wrap_without_a_preamble_is_the_bare_command():
-    assert wrap(env(), 'python run.py') == 'python run.py'
+    assert with_preamble(env(), 'python run.py') == 'python run.py'
 
 
 # -- config plumbing -----------------------------------------------------
@@ -302,14 +276,14 @@ def test_config_reads_the_new_keys(tmp_path):
             'kind': 'conda',
             'conda_env': 'phoebe-dev',
             'conda_base': '/opt/conda',
-            'pre_activation': ['source /etc/profile.d/modules.sh'],
-            'post_activation': ['echo late'],
+            'pre_activation_cmds': ['source /etc/profile.d/modules.sh'],
+            'post_activation_cmds': ['echo late'],
         }
     })
     cfg = tether.server('x', config_dir=tmp_path).environments['phoebe']
     assert cfg.conda_base == '/opt/conda'
-    assert cfg.pre_activation == ('source /etc/profile.d/modules.sh',)
-    assert cfg.post_activation == ('echo late',)
+    assert cfg.pre_activation_cmds == ('source /etc/profile.d/modules.sh',)
+    assert cfg.post_activation_cmds == ('echo late',)
 
 
 def test_superseded_key_names_are_rejected_not_ignored(tmp_path):
@@ -344,3 +318,36 @@ def test_server_exposes_the_preamble(tmp_path):
 def test_server_without_environment_has_an_empty_preamble(tmp_path):
     srv = tether.server('nonexistent.invalid', config_dir=tmp_path)
     assert srv.preamble == ''
+
+
+# -- proof that activation took effect ------------------------------------
+#
+# Exit status cannot see an `activate` that ran and did nothing, so each kind
+# names its own evidence. These need no machine: the probe's reported values
+# are just a dict.
+
+
+def test_bare_metal_has_nothing_to_prove():
+    """No activation was attempted, so none can have failed."""
+    assert env().activation_failure({}) is None
+
+
+def test_a_venv_must_show_virtual_env():
+    cfg = env(kind=EnvironmentKind.VENV, path='/opt/venv')
+    assert cfg.activation_failure({'VIRTUAL_ENV': '/opt/venv'}) is None
+    assert cfg.activation_failure({'VIRTUAL_ENV': ''}) == '$VIRTUAL_ENV is unset'
+    assert cfg.activation_failure({}) == '$VIRTUAL_ENV is unset'
+
+
+def test_a_conda_env_must_show_conda_prefix():
+    cfg = env(kind=EnvironmentKind.CONDA)
+    assert cfg.activation_failure({'CONDA_PREFIX': '/opt/conda/envs/x'}) is None
+    assert cfg.activation_failure({'CONDA_PREFIX': ''}) == '$CONDA_PREFIX is unset'
+
+
+def test_each_kind_ignores_the_other_kind_variable():
+    """A venv that set CONDA_PREFIX, or vice versa, proves nothing."""
+    venv = env(kind=EnvironmentKind.VENV, path='/opt/venv')
+    conda = env(kind=EnvironmentKind.CONDA)
+    assert venv.activation_failure({'CONDA_PREFIX': '/opt/conda'}) is not None
+    assert conda.activation_failure({'VIRTUAL_ENV': '/opt/venv'}) is not None

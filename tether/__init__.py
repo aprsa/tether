@@ -17,7 +17,8 @@ connection is a disposable, reconnectable link. Jobs outlive Python
 sessions.
 """
 
-from . import environment
+from . import conda, environment
+from .conda import CondaInstallation
 from .config import ServerKind, delete_server, list_servers, server_path
 from .environment import (
     Environment,
@@ -43,6 +44,7 @@ __version__ = '0.1.0'
 
 __all__ = [
     'EnvActivationError',
+    'CondaInstallation',
     'ConfigError',
     'Environment',
     'EnvironmentInfo',
@@ -63,6 +65,7 @@ __all__ = [
     'Link',
     'LinkError',
     'env',
+    'conda',
     'environment',
     'delete_server',
     'server_path',

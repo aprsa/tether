@@ -242,7 +242,7 @@ def test_save_then_load_round_trips(tmp_path):
     srv.add_environment(tether.CondaEnvironment(
         'phoebe',
         conda_base='/opt/conda',
-        pre_activation=('source "$HOME/hook.sh"',),   # quotes must survive
+        pre_activation_cmds=('source "$HOME/hook.sh"',),   # quotes must survive
         env={'OMP_NUM_THREADS': '1'},
     ))
     path = srv.save(config_dir=tmp_path)

@@ -5,8 +5,8 @@ activation lines, so adding a kind is adding a corresponding class.
 
 Activation order:
 
-================  ==============================================================
-pre_activation    Verbatim lines first. `module` is normally a shell function
+pre_activation_cmds
+                  Verbatim lines first. `module` is normally a shell function
                   sourced from /etc/profile.d, and conda's `activate` needs its
                   hook sourced, so a non-interactive shell frequently cannot run
                   either until something makes them available. This is that
@@ -17,64 +17,30 @@ env               `export` each variable before activation so that variables
                   `PYTHONNOUSERSITE`) take effect.
 activation        conda or venv. Last of the machinery, so the PATH it prepends
                   wins over everything above it.
-post_activation   Verbatim lines last: the final word, after activation.
-================  ==============================================================
+post_activation_cmds
+                  Verbatim lines last: the final word, after activation.
 
 Failures raise exceptions. `module load` and activation are emitted with an explicit
 guard, because a `conda activate` that quietly fails would run the payload
 against the wrong interpreter and produce a baffling error much later, far
 from its cause.
-
-Tilde is not expanded in quoted paths; use $HOME instead. See `remote_path`.
 """
 
 from __future__ import annotations
 
-import re
 import shlex
 from dataclasses import MISSING, dataclass, field, fields
 from enum import StrEnum
 from typing import ClassVar
 
 from .errors import ConfigError
+from .shell import run_or_abort, is_identifier, remote_path
 
 
 class EnvironmentKind(StrEnum):
     CONDA = 'conda'
     VENV = 'venv'
     NONE = 'none'
-
-
-def remote_path(path: str) -> str:
-    """Quote a path for the remote shell, preserving `~` expansion.
-
-    `shlex.quote('~/env')` returns `'~/env'`, and those quotes stop the shell
-    from expanding the tilde, so the path silently resolves to a literal `~`
-    directory that does not exist. A leading `~` therefore becomes `$HOME`
-    inside double quotes, which still protects spaces.
-
-    `~user` is left to `shlex.quote`: it has no `$HOME` equivalent, so it is
-    better to quote it and fail loudly than to expand it wrongly.
-    """
-
-    #: Characters that keep their special meaning inside double quotes.
-    _IN_DQUOTES = re.compile(r'([\\"$`])')
-
-    if path == '~':
-        return '"$HOME"'
-    if path.startswith('~/'):
-        return f'"$HOME/{_IN_DQUOTES.sub(r"\\\1", path[2:])}"'
-    return shlex.quote(path)
-
-
-def guard(command: str, message: str) -> str:
-    """Run `command`, and abort loudly rather than continue if it fails."""
-    complaint = shlex.quote(f'tether: {message}')
-    return f'{command} || {{ echo {complaint} >&2; exit 1; }}'
-
-
-#: A shell variable name. Anything else could smuggle code into an `export`.
-_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 
 
 @dataclass(frozen=True)
@@ -86,47 +52,80 @@ class Environment:
 
     name: str
     modules: tuple[str, ...] = ()
-    pre_activation: tuple[str, ...] = ()
-    post_activation: tuple[str, ...] = ()
+    pre_activation_cmds: tuple[str, ...] = ()
+    post_activation_cmds: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     mpirun: str = 'mpirun'
 
-    #: The discriminator, in config and on the class. A ClassVar rather than a
-    #: field so a saved kind can never disagree with the class holding it.
-    kind: ClassVar[EnvironmentKind] = EnvironmentKind.NONE
-
-    #: The variable that proves activation actually happened. `None` for bare
-    #: metal, where there is nothing to prove.
-    marker: ClassVar[str | None] = None
+    # placeholder for subclass's kind:
+    kind: ClassVar[EnvironmentKind]
 
     def __post_init__(self) -> None:
         # JSON gives lists; the fields are tuples. Normalize so a constructed
         # environment compares equal to the same one loaded back from disk.
-        for name in ('modules', 'pre_activation', 'post_activation'):
+        for name in ('modules', 'pre_activation_cmds', 'post_activation_cmds'):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
-    # to be (optionally) overloaded by subclasses:
+    # overloadable methods:
 
     def activation(self) -> list[str]:
         """The lines that enter the environment. Bare metal enters nothing."""
         return []
 
-    def lines(self) -> list[str]:
-        """Every line that prepares this environment, in order."""
+    def activation_failure(self, reported: dict[str, str]) -> str | None:
+        """Why activation did not take effect, or `None` if it did.
+
+        Activation can exit 0 and accomplish nothing -- an `activate` script
+        that is empty, a hook that declined quietly -- so exit status alone
+        cannot be trusted. `reported` maps variable name to the value the
+        remote shell had once activation was supposed to have happened, and
+        each kind knows which of those is its own evidence.
+
+        Bare metal has nothing to prove, so nothing can fail.
+        """
+        return None
+
+    def pre_activation(self) -> list[str]:
+        """Everything up to, but not including, activation.
+
+        The split exists because two callers need the machinery made available
+        without entering the environment: discovery, which runs before there is
+        anything to enter, and creation, which is what brings it into being.
+        Both would fail on the activation step -- and both need
+        `pre_activation_cmds` and `modules`, since that is how conda or a newer
+        python reaches PATH in the first place.
+
+        Not to be confused with the field it starts from: `pre_activation_cmds`
+        is the verbatim lines a user wrote, while this is *everything* that runs
+        before activation, module loads and exports included.
+        """
         return [
-            *self.pre_activation,
-            *(guard(f'module load {shlex.quote(m)}', f'module load {m} failed')
-              for m in self.modules),
+            *self.pre_activation_cmds,
+            *(run_or_abort(
+                f'module load {shlex.quote(m)}', f'module load {m} failed'
+            ) for m in self.modules),
             *self.exports(),
-            *self.activation(),
-            *self.post_activation,
         ]
 
-    def preamble(self) -> str:
-        """`lines()` as one shell script -- every slot, not just one of them."""
-        return '\n'.join(self.lines())
+    def post_activation(self) -> list[str]:
+        """`post_activation_cmds`, verbatim.
 
-    def wrap(self, command: str) -> str:
+        An identity wrapper, and deliberately so: it exists to make the three
+        stages read alike in `preamble()`. Nothing transforms these lines --
+        unlike modules and exports, they are emitted exactly as written.
+        """
+        return list(self.post_activation_cmds)
+
+    def preamble(self) -> str:
+        """Every slot, in order, as one shell script: the whole of what runs
+        ahead of the payload."""
+        return '\n'.join([
+            *self.pre_activation(),
+            *self.activation(),
+            *self.post_activation(),
+        ])
+
+    def with_preamble(self, command: str) -> str:
         """`command`, preceded by whatever prepares this environment."""
         preamble = self.preamble()
         return f'{preamble}\n{command}' if preamble else command
@@ -155,12 +154,12 @@ class Environment:
         """`export` lines. Values are quoted, so they are literal by design.
 
         A value cannot reference another variable -- `export B='$A'` stays a
-        dollar sign. Use `pre_activation` or `post_activation` when a value has
+        dollar sign. Use `pre_activation_cmds` or `post_activation_cmds` when a value has
         to be evaluated by the shell.
         """
         lines = []
         for key, value in self.env.items():
-            if not _IDENTIFIER.match(key):
+            if not is_identifier(key):
                 raise ConfigError(
                     f'not a usable shell variable name: {key!r} '
                     f'(expected letters, digits and underscore, not starting '
@@ -188,7 +187,6 @@ class VenvEnvironment(Environment):
     path: str | None = None
 
     kind: ClassVar[EnvironmentKind] = EnvironmentKind.VENV
-    marker: ClassVar[str | None] = 'VIRTUAL_ENV'
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -198,11 +196,18 @@ class VenvEnvironment(Environment):
             )
 
     def activation(self) -> list[str]:
+        assert self.path is not None  # mypy cannot see the __post_init__ above
         script = f'{self.path.rstrip("/")}/bin/activate'
         return [
-            guard(f'source {remote_path(script)}',
-                  f'could not activate venv {self.path}')
+            run_or_abort(
+                f'source {remote_path(script)}',
+                f'could not activate venv {self.path}'
+            )
         ]
+
+    def activation_failure(self, reported: dict[str, str]) -> str | None:
+        """`activate` sets `VIRTUAL_ENV`; an empty or truncated one does not."""
+        return None if reported.get('VIRTUAL_ENV') else '$VIRTUAL_ENV is unset'
 
 
 @dataclass(frozen=True)
@@ -218,7 +223,6 @@ class CondaEnvironment(Environment):
     conda_base: str | None = None
 
     kind: ClassVar[EnvironmentKind] = EnvironmentKind.CONDA
-    marker: ClassVar[str | None] = 'CONDA_PREFIX'
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -231,8 +235,10 @@ class CondaEnvironment(Environment):
         if self.conda_base:
             hook = f'{self.conda_base.rstrip("/")}/etc/profile.d/conda.sh'
             enable = [
-                guard(f'source {remote_path(hook)}',
-                      f'could not source conda hook at {hook}')
+                run_or_abort(
+                    f'source {remote_path(hook)}',
+                    f'could not source conda hook at {hook}'
+                )
             ]
         else:
             # The presence check is a separate line on purpose. `eval "$(conda
@@ -241,17 +247,29 @@ class CondaEnvironment(Environment):
             # guard on the eval never fires -- the failure then surfaces a line
             # later blaming the environment rather than the missing conda.
             enable = [
-                guard('command -v conda >/dev/null 2>&1',
-                      'conda is not on PATH; set conda_base, load a module, '
-                      'or source its hook in pre_activation'),
-                guard('eval "$(conda shell.bash hook)"', 'conda shell hook failed'),
+                run_or_abort(
+                    'command -v conda >/dev/null 2>&1',
+                    'conda is not on PATH; set conda_base, load a module, '
+                    'or source its hook in pre_activation_cmds'
+                ),
+                run_or_abort(
+                    'eval "$(conda shell.bash hook)"',
+                    'conda shell hook failed'
+                ),
             ]
 
+        assert self.conda_env is not None  # mypy cannot see the __post_init__ above
         return [
             *enable,
-            guard(f'conda activate {shlex.quote(self.conda_env)}',
-                  f'could not activate conda environment {self.conda_env}'),
+            run_or_abort(
+                f'conda activate {shlex.quote(self.conda_env)}',
+                f'could not activate conda environment {self.conda_env}'
+            ),
         ]
+
+    def activation_failure(self, reported: dict[str, str]) -> str | None:
+        """`conda activate` sets `CONDA_PREFIX`; a hook that declined does not."""
+        return None if reported.get('CONDA_PREFIX') else '$CONDA_PREFIX is unset'
 
 
 #: kind -> class. Adding a kind is one line here plus the class itself.
@@ -293,9 +311,15 @@ def env(name: str, kind: EnvironmentKind | str = EnvironmentKind.NONE,
 # there is nothing to prepare. These keep that case out of every caller.
 
 
-def create_preamble(environment: Environment | None) -> str:
+def pre_activation(environment: Environment | None) -> str:
+    """`pre_activation()` as a script, or nothing if unconfigured. The class keeps
+    only the list form, since this is the one caller that wants it joined."""
+    return '\n'.join(environment.pre_activation()) if environment else ''
+
+
+def preamble(environment: Environment | None) -> str:
     return environment.preamble() if environment else ''
 
 
-def wrap(environment: Environment | None, command: str) -> str:
-    return environment.wrap(command) if environment else command
+def with_preamble(environment: Environment | None, command: str) -> str:
+    return environment.with_preamble(command) if environment else command

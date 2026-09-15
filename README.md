@@ -29,8 +29,10 @@ is **make reconnection invisible**.
 |---|---|---|
 | 0 | `event_loop.py` | The sync/async boundary. Knows nothing about SSH |
 | 1 | `link.py` | SSH only: `run`, `put`, `get`, reconnect, timeouts |
+| 2 | `shell.py` | Quoting and emission. Assumes bash. Pure — no I/O, unit-testable |
 | 2 | `slurm.py` | Slurm formats and parsers. Pure — no I/O, unit-testable |
-| 2 | `environment.py` | Shell activation lines. Pure — no I/O, unit-testable |
+| 2 | `environment.py` | Activation lines. Pure — no I/O, unit-testable |
+| 2 | `conda.py` | Conda discovery. Takes its transport as an argument, so it is unit-testable against a dict |
 | 3 | `server.py` | `Server` / `SlurmServer`: the API PHOEBE talks to |
 
 `Server.run()` is a deliberate escape hatch at every level: tether should never
@@ -89,7 +91,7 @@ The filename **is** the server's name, so renaming a server is a `mv`, and
 hard error — a typo in a config file should be loud.
 
 **Environments are nested inside their server, not shared between servers.**
-In practice they do not generalise: `modules`, `pre_activation` and
+In practice they do not generalise: `modules`, `pre_activation_cmds` and
 `conda_base` each encode one cluster's assumptions, and only `kind` and `name`
 travel. Nesting also makes it impossible to point a server at an environment
 meant for a different machine.
@@ -150,19 +152,19 @@ The generated shell runs in a fixed order, and every slot earns its place:
 
 | Slot | What it is for |
 |---|---|
-| `pre_activation` | Verbatim lines, first. Makes the machinery available. |
+| `pre_activation_cmds` | Verbatim lines, first. Makes the machinery available. |
 | `modules` | `module load` each entry, in order |
 | `env` | `export` each variable — before activation, so vars that *configure* activation take effect |
 | activation | conda or venv; its `PATH` wins over everything above |
-| `post_activation` | Verbatim lines, last: the final word after activation |
+| `post_activation_cmds` | Verbatim lines, last: the final word after activation |
 
-`pre_activation` exists because of a specific cluster reality: `module` is
+`pre_activation_cmds` exists because of a specific cluster reality: `module` is
 normally a shell *function* sourced from `/etc/profile.d`, and `conda activate`
 needs its hook sourced, so a non-interactive shell often cannot run either until
 something makes them available. That is what this slot is for:
 
 ```json
-"pre_activation": ["source /etc/profile.d/modules.sh"]
+"pre_activation_cmds": ["source /etc/profile.d/modules.sh"]
 ```
 
 Both verbatim slots run *before* the payload; they differ only in which side of
@@ -173,6 +175,29 @@ the wrapper script and its exit-code trap.
 guard that aborts rather than continues. A `conda activate` that quietly fails
 would otherwise run the payload against the wrong interpreter and surface much
 later as an unrelated `ImportError`.
+
+**Finding conda.** `probe_conda()` reports the installations this account can
+actually reach, from three sources: `$PATH` — evaluated *after* `pre_activation_cmds`
+and `modules`, so a conda that only appears once a module is loaded counts —
+conda's own record in `~/.conda/environments.txt`, and `<workdir>/conda` where
+tether installs its own.
+
+```python
+for install in srv.probe_conda():
+    print(install)
+# /home/users/andrej/crimpl-conda (conda 25.5.1): no environments
+# /home/users/andrej/miniconda3 (conda 25.5.1): crimpl
+```
+
+It deliberately does **not** search conventional directories. Such a list can
+never be exhaustive, so "found nothing" would not mean "there is no conda" — and
+a wrong answer that looks thorough is worse than no answer. An installation
+somewhere else is reachable by naming it in `conda_base`, or by making it
+reachable from `pre_activation_cmds`, which then also makes it discoverable.
+
+Environment names include conda's per-user fallback `~/.conda/envs`, because a
+named environment created against a site install lands there rather than under
+the base — and `conda activate <name>` finds it either way.
 
 **Verify before you depend on it.** `verify_environment()` activates and reports
 what came back, so a broken environment is caught before a job is built on it:
@@ -196,7 +221,7 @@ path suppresses tilde expansion, so `source '~/venv/bin/activate'` would look
 correct and silently fail.
 
 Environment variable *values* are quoted, so they are literal: `env` cannot
-reference another variable. Use `pre_activation`/`post_activation` when a value
+reference another variable. Use `pre_activation_cmds`/`post_activation_cmds` when a value
 has to be computed by the shell.
 
 `mpirun` is parsed but inert until job submission lands.
@@ -321,7 +346,7 @@ MariaDB actually run, so job states, exit codes, `sbatch` rejections and `sacct`
 history are Slurm's own; conda is a real Miniforge install (pinned and
 checksum-verified); `module` is real environment-modules. That last one matters:
 `module` is a shell *function* from `/etc/profile.d`, absent from a
-non-interactive SSH command, which is exactly the condition `pre_activation`
+non-interactive SSH command, which is exactly the condition `pre_activation_cmds`
 exists for — and the tests assert it rather than assume it.
 
 Everything lives in **one container** on purpose. It emulates a single computing

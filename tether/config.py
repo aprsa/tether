@@ -21,7 +21,7 @@ lives in that file, environments included::
     }
 
 Environments are nested rather than shared between servers because in practice
-they do not generalise: `modules`, `pre_activation` and `conda_base` each encode
+they do not generalize: `modules`, `pre_activation_cmds` and `conda_base` each encode
 one cluster's assumptions, and only `kind` and `name` travel. A shared
 definition could not say which cluster it was written against, and nesting
 makes it impossible to point a server at an environment meant for another.

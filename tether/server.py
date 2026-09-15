@@ -13,11 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
+from . import conda as _conda
 from . import environment as _environment
 from . import slurm as _slurm
 from .config import DEFAULT_WORKDIR, ServerKind, _load_server, _save_server
+from .conda import CondaInstallation
 from .environment import Environment
 from .errors import ConfigError, EnvActivationError, SlurmError
+from .shell import printf
 from .slurm import Job, Partition
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
 
@@ -245,14 +248,14 @@ class Server:
         if timeout is _UNSET:
             timeout = self.timeout
         if environment:
-            command = _environment.wrap(self.environment, command)
+            command = _environment.with_preamble(self.environment, command)
         return self._link.run(command, check=check, timeout=timeout)
 
     @property
     def home(self) -> str:
         """The remote home directory. Resolved once, then cached."""
         if self._home is None:
-            self._home = self.run('printf %s "$HOME"', check=True).stdout.strip()
+            self._home = self.run(printf('"$HOME"'), check=True).stdout.strip()
         return self._home
 
     def path(self, *parts: str) -> str:
@@ -277,7 +280,21 @@ class Server:
         Empty when no environment is configured. Worth printing when a job
         misbehaves: it is exactly what runs ahead of the payload.
         """
-        return _environment.create_preamble(self.environment)
+        return _environment.preamble(self.environment)
+
+    def probe_conda(self) -> list[CondaInstallation]:
+        """Every conda installation this account can reach, and its environments.
+
+        Delegates to `conda.probe()`, handing it this server's `run` and the
+        environment's own `pre_activation()` -- so a conda that only appears once
+        `module load anaconda` has run is found. See that function for what is
+        searched, what is deliberately not, and why.
+        """
+        return _conda.probe(
+            lambda command: self.run(command, check=True).stdout,
+            self.path('conda'),
+            setup=_environment.pre_activation(self.environment),
+        )
 
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.
@@ -292,9 +309,9 @@ class Server:
         label = env.name if env else ''
 
         env_probe = (
-            'printf \'%s\\n%s\\n\' "${VIRTUAL_ENV-}" "${CONDA_PREFIX-}"\n'
-            'command -v python3 >/dev/null 2>&1 && python3 -c '
-            "'import sys; print(sys.executable); print(sys.version.split()[0]); "
+            printf('"${VIRTUAL_ENV-}"', '"${CONDA_PREFIX-}"') + '\n'
+            + 'command -v python3 >/dev/null 2>&1 && python3 -c '
+            + "'import sys; print(sys.executable); print(sys.version.split()[0]); "
             "print(sys.prefix)'"
         )
 
@@ -305,20 +322,19 @@ class Server:
                 f'{self.host}: {result.stderr.strip() or "no output"}'
             )
 
-        reported = (result.stdout.splitlines() + [''] * 5)[:5]
+        values = (result.stdout.splitlines() + [''] * 5)[:5]
         virtual_env, conda_prefix, python, version, prefix = (
-            value.strip() for value in reported
+            value.strip() for value in values
         )
 
         # Activation can "succeed" and do nothing -- an `activate` script that
-        # is a no-op, or a hook that silently declined. Each kind names the
-        # variable that proves otherwise; bare metal names none.
-        marker = env.marker if env else None
+        # is a no-op, or a hook that silently declined. Each kind knows its own
+        # evidence; bare metal has none to give, and so cannot fail here.
         reported = {'VIRTUAL_ENV': virtual_env, 'CONDA_PREFIX': conda_prefix}
-        if marker and not reported[marker]:
+        if env and (why := env.activation_failure(reported)):
             raise EnvActivationError(
                 f'environment {label!r} reported success on {self.host} but '
-                f'${marker} is unset, so nothing was activated'
+                f'{why}, so nothing was activated'
             )
 
         return EnvironmentInfo(

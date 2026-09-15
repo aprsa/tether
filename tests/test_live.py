@@ -480,7 +480,13 @@ def test_sacct_covers_the_case_the_sentinel_cannot(srv):
         f'sacct -j {jobid} -n --parsable2 --format=JobID,State,ExitCode',
         check=True,
     ).stdout
-    assert f'{jobid}.batch|CANCELLED|0:15' in steps    # SIGTERM, no exit status
+    batch = next(ln for ln in steps.splitlines() if ln.startswith(f'{jobid}.batch|'))
+    state, code = batch.split('|')[1:3]
+    # Killed by a signal, so there is no exit status -- which signal depends on
+    # whether the job handled SIGTERM before Slurm escalated to SIGKILL, and
+    # under load it often does not. Asserting 0:15 specifically made this flaky.
+    assert state == 'CANCELLED'
+    assert code.startswith('0:') and code != '0:0', f'expected a signal, got {code}'
 
 
 def test_sacct_is_silent_about_a_job_that_never_existed(srv):
@@ -541,13 +547,13 @@ def test_conda_without_conda_base_fails_because_conda_is_not_on_path(rig, tmp_pa
 
 
 def test_conda_found_via_pre_activation(rig, tmp_path):
-    """...and sourcing the hook in pre_activation is the documented cure."""
+    """...and sourcing the hook in pre_activation_cmds is the documented cure."""
     srv = env_server(
         rig,
         tmp_path,
         kind='conda',
         conda_env=CONDA_ENV,
-        pre_activation=[f'source {CONDA_BASE}/etc/profile.d/conda.sh'],
+        pre_activation_cmds=[f'source {CONDA_BASE}/etc/profile.d/conda.sh'],
     )
     info = srv.verify_environment()
     srv.close()
@@ -576,6 +582,25 @@ def test_missing_venv_is_an_activation_error(rig, tmp_path):
     srv.close()
 
 
+def test_a_venv_that_activates_but_does_nothing_is_caught(rig, tmp_path, plain):
+    """The one failure `run_or_abort` structurally cannot see.
+
+    An `activate` script that exists but is empty -- an interrupted `python -m
+    venv`, a stale mount, a half-copied tree -- sources cleanly and returns 0.
+    Without the evidence check this reports success and the payload then runs
+    against the system interpreter.
+    """
+    faux = '/tmp/tether-faux-venv'
+    plain.run(f'mkdir -p {faux}/bin && : > {faux}/bin/activate', check=True)
+    try:
+        srv = env_server(rig, tmp_path, kind='venv', path=faux)
+        with pytest.raises(tether.EnvActivationError, match=r'\$VIRTUAL_ENV is unset'):
+            srv.verify_environment()
+        srv.close()
+    finally:
+        plain.run(f'rm -rf {faux}', check=True)
+
+
 def test_missing_conda_env_is_an_activation_error(rig, tmp_path):
     srv = env_server(
         rig, tmp_path, kind='conda', conda_env='no-such-env', conda_base=CONDA_BASE
@@ -585,11 +610,11 @@ def test_missing_conda_env_is_an_activation_error(rig, tmp_path):
     srv.close()
 
 
-# -- modules: the reason pre_activation exists ---------------------------
+# -- modules: the reason pre_activation_cmds exists ---------------------------
 
 
 def test_module_is_absent_from_a_non_interactive_shell(plain):
-    """The premise behind `pre_activation`, asserted rather than assumed.
+    """The premise behind `pre_activation_cmds`, asserted rather than assumed.
 
     `module` is a shell function from /etc/profile.d, and a non-interactive SSH
     command never sources it. This is real cluster behaviour, not a quirk of
@@ -611,7 +636,7 @@ def test_module_load_works_once_pre_activation_sources_it(rig, tmp_path):
         tmp_path,
         kind='none',
         modules=[MODULE],
-        pre_activation=[f'source {MODULES_INIT}'],
+        pre_activation_cmds=[f'source {MODULES_INIT}'],
     )
     srv.verify_environment()          # activation succeeds...
     loaded = srv.run('printf %s "${TETHER_MODULE_LOADED-unset}"', environment=True)
@@ -625,7 +650,7 @@ def test_unknown_module_is_an_activation_error(rig, tmp_path):
         tmp_path,
         kind='none',
         modules=['no-such-module/9.9'],
-        pre_activation=[f'source {MODULES_INIT}'],
+        pre_activation_cmds=[f'source {MODULES_INIT}'],
     )
     with pytest.raises(tether.EnvActivationError, match='module load'):
         srv.verify_environment()
@@ -651,8 +676,8 @@ def test_verbatim_slots_land_on_the_right_side_of_activation(rig, tmp_path):
         tmp_path,
         kind='venv',
         path=VENV,
-        pre_activation=['echo "pre:${VIRTUAL_ENV-unset}"'],
-        post_activation=['echo "post:${VIRTUAL_ENV-unset}"'],
+        pre_activation_cmds=['echo "pre:${VIRTUAL_ENV-unset}"'],
+        post_activation_cmds=['echo "post:${VIRTUAL_ENV-unset}"'],
     )
     out = srv.run('true', check=True, environment=True).stdout
     srv.close()
@@ -697,3 +722,80 @@ def test_environment_applies_to_a_real_job(rig, tmp_path, srv):
     state, _ = outcome(srv, jobid)
     assert state == 'COMPLETED'
     assert srv.run(f'cat ~/jobs/slurm-{jobid}.out', check=True).stdout.strip() == VENV
+
+
+# -- conda discovery -----------------------------------------------------
+
+
+def test_probe_conda_finds_nothing_it_cannot_reach(plain):
+    """The rig keeps conda off PATH, and it is not in this user's
+    environments.txt, so an honest probe reports nothing.
+
+    A conventional-directory search would "find" /opt/conda here -- and be
+    wrong on any cluster that puts conda somewhere else. Not looking is the
+    point: an empty result means "nothing reachable", not "nothing exists".
+    """
+    assert plain.probe_conda() == []
+
+
+def test_pre_activation_makes_conda_discoverable(rig, tmp_path):
+    """...and naming how to reach it is what makes it visible. This is the
+    case `pre_activation_cmds` exists for."""
+    srv = env_server(rig, tmp_path, kind='none',
+                     pre_activation_cmds=[f'source {CONDA_BASE}/etc/profile.d/conda.sh'])
+    try:
+        installs = {i.base: i for i in srv.probe_conda()}
+        assert CONDA_BASE in installs
+        found = installs[CONDA_BASE]
+        assert found.version and found.version != 'unknown'
+        assert CONDA_ENV in found.environments
+    finally:
+        srv.close()
+
+
+def test_conda_is_found_by_path_alone(rig, tmp_path):
+    """`type -P`, not `command -v`: once conda's hook is sourced, conda is a
+    shell *function* and `command -v` answers "conda" rather than a path."""
+    srv = env_server(rig, tmp_path, kind='none',
+                     pre_activation_cmds=[f'export PATH={CONDA_BASE}/bin:$PATH'])
+    try:
+        assert CONDA_BASE in {i.base for i in srv.probe_conda()}
+    finally:
+        srv.close()
+
+
+def test_probe_conda_sees_the_per_user_fallback(rig, tmp_path):
+    """A named environment created against a base the user cannot write to
+    lands in ~/.conda/envs, and `conda activate <name>` still finds it -- so
+    the probe has to as well, or it would under-report what is usable."""
+    srv = env_server(rig, tmp_path, kind='none',
+                     pre_activation_cmds=[f'source {CONDA_BASE}/etc/profile.d/conda.sh'])
+    try:
+        srv.run(
+            f'source {CONDA_BASE}/etc/profile.d/conda.sh && '
+            f'conda create -y -n fallback-probe --no-default-packages',
+            check=True, timeout=300,
+        )
+        where = srv.run('ls -d ~/.conda/envs/fallback-probe', check=True).stdout
+        assert where.strip().endswith('.conda/envs/fallback-probe')   # premise
+
+        found = next(i for i in srv.probe_conda() if i.base == CONDA_BASE)
+        assert 'fallback-probe' in found.environments
+    finally:
+        srv.run('rm -rf ~/.conda/envs/fallback-probe')
+        srv.close()
+
+
+def test_probe_finds_a_conda_at_the_workdir_prefix(plain):
+    """Where `install_conda()` puts one. This path was silently broken: the
+    candidate was emitted with a literal backslash-n, so the base never
+    matched -- and no test noticed, because nothing had ever installed there.
+    """
+    target = plain.path('conda')
+    plain.run(f'mkdir -p {plain.path()} && ln -sfn {CONDA_BASE} {target}', check=True)
+    try:
+        found = {i.base: i for i in plain.probe_conda()}
+        assert target in found, f'workdir conda not discovered; saw {list(found)}'
+        assert found[target].version != 'unknown'
+    finally:
+        plain.run(f'rm -f {target}')
