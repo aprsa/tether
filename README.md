@@ -17,13 +17,9 @@ Requires Python 3.12+. Runtime dependency: `asyncssh`.
 A submitted Slurm job routinely outlives the local Python session, so the
 connection cannot carry job identity. A job is fully described by
 `(server, remote_dir, jobid)`, and any fresh `tether` instance with the same
-credentials can reattach and query it.
+credentials can reattach and query it. It is crash-resilient because `tether` does not keep the connection alive; rather, it makes the reconnection opaque to the user.
 
-This makes reconnection a non-event rather than a feature: crash resilience
-falls out for free, and the honest restatement of "keep the connection alive"
-is **make reconnection invisible**.
-
-## Layers
+<!-- ## Layers
 
 | Layer | Module | Knows about |
 |---|---|---|
@@ -32,35 +28,32 @@ is **make reconnection invisible**.
 | 2 | `shell.py` | Quoting and emission. Assumes bash. Pure — no I/O, unit-testable |
 | 2 | `slurm.py` | Slurm formats and parsers. Pure — no I/O, unit-testable |
 | 2 | `environment.py` | Activation lines. Pure — no I/O, unit-testable |
-| 2 | `conda.py` | Conda discovery. Takes its transport as an argument, so it is unit-testable against a dict |
+| 2 | `conda.py` | Finding and installing conda. Takes its transport as an argument, so it is unit-testable against a dict |
+| 2 | `venv.py` | Interpreters and virtual environments. Same |
 | 3 | `server.py` | `Server` / `SlurmServer`: the API PHOEBE talks to |
 
 `Server.run()` is a deliberate escape hatch at every level: tether should never
-be the reason something is impossible.
+be the reason something is impossible. -->
 
 ## Usage
 
 ```python
 import tether
 
-with tether.server("terra") as terra:
+with tether.server('terra') as terra:
     print(terra.info())            # terra.villanova.edu (6.8.0-51-generic, 128 cpus)
     print(terra.slurm_version)     # slurm 23.02.7
 
     for p in terra.partitions():   # how busy is the cluster?
-        print(p.name, p.nodes_idle, "/", p.nodes_total, "idle")
+        print(p.name, p.nodes_idle, '/', p.nodes_total, 'idle')
 
     for job in terra.queue(user=terra.whoami()):
         print(job.jobid, job.state, job.elapsed, job.name)
 ```
 
-No config file is needed — `Server("terra")` falls through to `~/.ssh/config`,
-which asyncssh reads natively (`Hostname`, `User`, `Port`, `IdentityFile`,
-`ProxyJump`, `ProxyCommand`, `Match`, `Include` all honoured). Let ssh own SSH.
+Config files are optional: `tether.server('terra')` falls through to `~/.ssh/config`, which asyncssh reads natively (`Hostname`, `User`, `Port`, `IdentityFile`, `ProxyJump`, `ProxyCommand`, `Match`, `Include` all honored): `tether` lets ssh own SSH.
 
-Pass `ssh_config="/path/to/config"` to read a specific file instead, akin
-to `ssh -F`. The test rig uses it to describe a throwaway server without
-touching `~/.ssh`.
+Custom ssh configurations are supported by passing `ssh_config='/path/to/config'` to read a specific file instead, akin to `ssh -F`.
 
 ## Configuration
 
@@ -86,69 +79,41 @@ Optional, one JSON file per server in `~/.tether/servers/`:
 }
 ```
 
-The filename **is** the server's name, so renaming a server is a `mv`, and
-`Server("terra")` reads one file rather than all of them. Unknown keys are a
-hard error — a typo in a config file should be loud.
+The filename corresponds to the server name, so renaming a filename is the same as renaming the server. Unknown server names (in `tether.server('server_name')`) raise an error.
 
-**Environments are nested inside their server, not shared between servers.**
-In practice they do not generalise: `modules`, `pre_activation_cmds` and
-`conda_base` each encode one cluster's assumptions, and only `kind` and `name`
-travel. Nesting also makes it impossible to point a server at an environment
-meant for a different machine.
+**Note**: Environments are nested inside their server, not shared between servers. In practice they do not generalise: `modules`, `pre_activation_cmds` and `conda_base` each encode one cluster's assumptions, and only `kind` and `name` travel. Nesting also makes it impossible to point a server at an environment meant for a different machine.
 
-**JSON rather than TOML** because tether writes these files as well as reading
-them, and the standard library can only *read* TOML. That keeps the runtime
-dependency list at one.
-
-There is one type, not two: a `Server` *is* its configuration, plus a link.
+Configuration can be saved straight from the `tether.server` object:
 
 ```python
-srv = tether.server("terra", host="terra.villanova.edu", user="andrej")
-srv.add_environment(tether.CondaEnvironment("phoebe", conda_base="/opt/conda"))
-srv.add_environment(tether.VenvEnvironment("dev", path="~/venvs/dev"))
+srv = tether.server('terra', host='terra.villanova.edu', user='andrej')
+srv.add_environment(tether.CondaEnvironment('phoebe', conda_base='/opt/conda'))
+srv.add_environment(tether.VenvEnvironment('dev', path='~/.venvs/dev'))
 srv.save()                         # -> ~/.tether/servers/terra.json
 
 tether.list_servers()              # -> ["terra", ...]
-tether.delete_server("terra")
+tether.delete_server('terra')
 ```
 
-Saving omits anything left at its default, so a file records what was actually
-chosen rather than every default in force the day it was written. Runtime state
-— the connection, cached lookups — is never written.
-
-`tether.server()` picks the class from the stored `kind`, which a plain
-constructor cannot do: the class depends on what the file says. Constructing the
-wrong one directly is a loud error rather than a silently degraded object.
+Saving omits anything left at its default, so a file records what was actually chosen rather than every default in force when it was written. Runtime state (the connection, cached lookups) is never written.
 
 ## Environments
 
-One class per kind — `SystemEnvironment` (bare metal), `VenvEnvironment`,
-`CondaEnvironment` — each owning its own fields, validation and activation
-lines. Adding a kind is adding a class, not adding a branch to four `if kind ==`
-chains:
+One class per kind: `SystemEnvironment` (bare metal), `VenvEnvironment`, `CondaEnvironment`, each owning its own fields, validation and activation lines.
 
 ```python
-tether.CondaEnvironment("phoebe", conda_base="/opt/conda")
-tether.VenvEnvironment("dev", path="~/venvs/dev", modules=["gcc"])
-tether.SystemEnvironment("bare")
+tether.CondaEnvironment('phoebe', conda_base='/opt/conda')
+tether.VenvEnvironment('dev', path='~/venvs/dev', modules=['gcc'])
+tether.SystemEnvironment('bare')
 
-tether.env("dev", "venv", path="~/venvs/dev")   # or by kind, mirroring server()
+tether.env('dev', 'venv', path='~/venvs/dev')   # or by kind, mirroring server()
 ```
 
-The first argument is the environment's **name**: tether's handle for it, and
-its key in the config file. It is not what gets activated — a venv named `dev`
-may live at `/scratch/venvs/phoebe-2.5`, and that name appears nowhere in the
-generated shell. What each kind activates is named for what it actually is: a
-venv has a `path` (there is no such thing as a venv *name*), and a conda
-environment has a `conda_env`, which defaults to the name since the two are
-usually the same word.
+The first argument is the environment's **name**: tether's handle for it, and its key in the config file. It is not what gets activated — a venv named `dev` may live at `/scratch/venvs/phoebe-2.5`, and that name appears nowhere in the generated shell. What each kind activates is named for what it actually is: a venv has a `path` (there is no such thing as a venv *name*), and a conda environment has a `conda_env`, which defaults to the name as the two are usually the same word.
 
-Fields belonging to another kind are refused because they are not fields on
-that class — `conda_base` on a venv is an error nobody had to write a check
-for. Validation happens at construction, so an environment that cannot be
-loaded back cannot be built in the first place, let alone saved.
+Fields belonging to another kind are refused because they are not fields on that class: `conda_base` on a venv is an error. Validation happens at construction, so an environment that cannot be loaded back cannot be built in the first place, let alone saved.
 
-The generated shell runs in a fixed order, and every slot earns its place:
+The generated shell runs in a fixed order:
 
 | Slot | What it is for |
 |---|---|
@@ -167,24 +132,13 @@ something makes them available. That is what this slot is for:
 "pre_activation_cmds": ["source /etc/profile.d/modules.sh"]
 ```
 
-Both verbatim slots run *before* the payload; they differ only in which side of
-activation they land on. Nothing here runs *after* the payload — that belongs to
-the wrapper script and its exit-code trap.
+**Failures are loud.** `module load` and activation are emitted with an explicit guard that aborts rather than continues on failure. A `conda activate` that quietly fails would otherwise run the payload against the wrong interpreter and surface much later as an unrelated `ImportError`.
 
-**Failures are loud.** `module load` and activation are emitted with an explicit
-guard that aborts rather than continues. A `conda activate` that quietly fails
-would otherwise run the payload against the wrong interpreter and surface much
-later as an unrelated `ImportError`.
-
-**Finding conda.** `probe_conda()` reports the installations this account can
-actually reach, from three sources: `$PATH` — evaluated *after* `pre_activation_cmds`
-and `modules`, so a conda that only appears once a module is loaded counts —
-conda's own record in `~/.conda/environments.txt`, and `<workdir>/conda` where
-tether installs its own.
+**Finding conda.** `probe_conda()` reports the installations this account can actually reach, from three sources: `$PATH` — evaluated *after* `pre_activation_cmds` and `modules`, so a conda that only appears once a module is loaded counts — conda's own record in `~/.conda/environments.txt`, and `<workdir>/conda` where tether installs its own.
 
 ```python
-for install in srv.probe_conda():
-    print(install)
+for condas in srv.probe_conda():
+    print(condas)
 # /home/users/andrej/crimpl-conda (conda 25.5.1): no environments
 # /home/users/andrej/miniconda3 (conda 25.5.1): crimpl
 ```
@@ -199,11 +153,34 @@ Environment names include conda's per-user fallback `~/.conda/envs`, because a
 named environment created against a site install lands there rather than under
 the base — and `conda activate <name>` finds it either way.
 
+**Provisioning.** `install_conda()` puts a Miniforge at `<workdir>/conda`, where
+`probe_conda()` already looks. `probe_interpreters()` lists the bare-metal
+pythons a venv can be built from — conda's are excluded, since conda
+environments are conda's job — and `create_venv()` builds one.
+
+```python
+srv1.install_conda()                              # <workdir>/conda
+
+srv2.probe_interpreters()
+srv2.create_venv('analysis', python='3.12')       # raises if 3.12 is not on PATH
+srv2.probe_venvs('~/.venvs', include_broken=True)
+```
+
+Both installers are idempotent: an existing, *working* installation is adopted
+rather than rebuilt, and one that exists but does not run raises rather than
+being overwritten. That guard matters more for venvs than for conda —
+`python -m venv` writes into an occupied directory and exits 0, so nothing but
+tether stands between a mistyped path and someone's working directory.
+
+`probe_venvs()` is told where to look rather than searching, because venv keeps
+no registry to ask and the filesystem is the wrong place to guess: on terra,
+`find $HOME` costs 22 seconds at the depth where venvs actually live.
+
 **Verify before you depend on it.** `verify_environment()` activates and reports
 what came back, so a broken environment is caught before a job is built on it:
 
 ```python
-with tether.server("terra") as terra:
+with tether.server('terra') as terra:
     print(terra.preamble)              # exactly what runs ahead of the payload
     print(terra.verify_environment())  # phoebe (conda): /opt/conda/envs/phoebe-dev
 ```
@@ -220,19 +197,13 @@ script was a no-op" is caught rather than trusted.
 path suppresses tilde expansion, so `source '~/venv/bin/activate'` would look
 correct and silently fail.
 
-Environment variable *values* are quoted, so they are literal: `env` cannot
-reference another variable. Use `pre_activation_cmds`/`post_activation_cmds` when a value
-has to be computed by the shell.
+Environment variable *values* are quoted, so they are literal: `env` cannot reference another variable. Use `pre_activation_cmds`/`post_activation_cmds` when a value has to be computed by the shell.
 
 `mpirun` is parsed but inert until job submission lands.
 
 ## Decisions worth knowing
 
-**One connection, many channels.** SSH multiplexes: each command is a channel on
-an already-authenticated link, so 50 commands cost one authentication.
-This is what keeps sshd's `MaxStartups` (and fail2ban) out of the picture.
-The SFTP client is held open for the same reason — each one spawns a subsystem
-channel and an `sftp-server` process remotely.
+**One connection, many channels.** SSH multiplexes: each command is a channel on an already-authenticated link, so 50 commands cost one authentication. The SFTP client is held open for the same reason — each one spawns a subsystem channel and an `sftp-server` process remotely.
 
 **The event loop runs on its own thread.** tether is synchronous; asyncssh is
 not. Rather than driving a loop in place with `run_until_complete` — which
@@ -314,8 +285,10 @@ which is caught internally.
 
 ## Not yet implemented
 
-Milestone 2, deliberately deferred:
+Environments are done; running things is not. Deliberately deferred:
 
+- `install(packages)` into an environment tether created — pip for venvs,
+  conda for conda environments
 - `submit()` and file staging into per-job directories
 - `sacct` for finished jobs, plus an exit-code sentinel written into the job
   directory so completion survives `sacct` retention policy
