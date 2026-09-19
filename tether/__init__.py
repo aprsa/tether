@@ -17,7 +17,7 @@ connection is a disposable, reconnectable link. Jobs outlive Python
 sessions.
 """
 
-from . import conda, environment
+from . import conda, environment, venv
 from .conda import CondaInstallation
 from .config import ServerKind, delete_server, list_servers, server_path
 from .environment import (
@@ -37,6 +37,7 @@ from .errors import (
     TetherError,
     LinkError,
 )
+from .venv import PythonInstallation, VenvInstallation
 from .server import EnvironmentInfo, Host, Server, SlurmServer, server
 from .slurm import Job, Partition, parse_duration
 from .link import Result, Link
@@ -57,6 +58,8 @@ __all__ = [
     'Host',
     'Job',
     'Partition',
+    'PythonInstallation',
+    'VenvInstallation',
     'RemoteCommandError',
     'Result',
     'Server',
@@ -69,6 +72,7 @@ __all__ = [
     'env',
     'conda',
     'environment',
+    'venv',
     'delete_server',
     'server_path',
     'list_servers',

@@ -16,9 +16,11 @@ from typing import Any, ClassVar, Self
 from . import conda as _conda
 from . import environment as _environment
 from . import slurm as _slurm
+from . import venv as _venv
 from .config import DEFAULT_WORKDIR, ServerKind, _load_server, _save_server
 from .conda import CondaInstallation
 from .environment import Environment
+from .venv import PythonInstallation, VenvInstallation
 from .errors import ConfigError, EnvActivationError, SlurmError
 from .shell import printf
 from .slurm import Job, Partition
@@ -323,6 +325,43 @@ class Server:
             installer=installer,
             sha256=sha256,
             adopt_if_exists=adopt_if_exists,
+        )
+
+    def probe_interpreters(self) -> list[PythonInstallation]:
+        """Every bare-metal python on PATH that a venv could be built from.
+
+        Runs the environment's `pre_activation()` first, so an interpreter that
+        only appears once `module load python/3.12` has run is found -- which
+        on a cluster is usually the only way a modern python appears at all.
+
+        Conda interpreters are deliberately excluded; see `venv.py` for why.
+        Use `probe_conda()` when a conda environment is what you want.
+        """
+        return _venv.probe_interpreters(
+            lambda command: self.run(command, check=True).stdout,
+            setup=_environment.pre_activation(self.environment),
+        )
+
+    def probe_venvs(
+        self,
+        venvs_base: str | None = None,
+        *,
+        include_broken: bool = False,
+    ) -> list[VenvInstallation]:
+        """The virtual environments tether can see here.
+
+        `venvs_base` may name one venv or a directory of them; it defaults to
+        `<workdir>/venvs`, where tether puts the ones it creates. An active
+        `$VIRTUAL_ENV` is always included.
+
+        The filesystem is not searched -- see `venv.probe_venvs()` for why, and
+        for what `include_broken` costs.
+        """
+        return _venv.probe_venvs(
+            lambda command: self.run(command, check=True).stdout,
+            venvs_base or self.path('venvs'),
+            setup=_environment.pre_activation(self.environment),
+            include_broken=include_broken,
         )
 
     def verify_environment(self) -> EnvironmentInfo:
