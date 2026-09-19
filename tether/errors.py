@@ -40,6 +40,11 @@ class CondaError(TetherError):
     """Conda could not be installed, or was found in an unusable state."""
 
 
+class VenvError(TetherError):
+    """A virtual environment could not be created, or was found in an
+    unusable state."""
+
+
 class SlurmError(TetherError):
     """Slurm is absent, or present and disagreed with us."""
 

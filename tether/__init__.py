@@ -36,6 +36,7 @@ from .errors import (
     SlurmError,
     TetherError,
     LinkError,
+    VenvError,
 )
 from .venv import PythonInstallation, VenvInstallation
 from .server import EnvironmentInfo, Host, Server, SlurmServer, server
@@ -59,6 +60,7 @@ __all__ = [
     'Job',
     'Partition',
     'PythonInstallation',
+    'VenvError',
     'VenvInstallation',
     'RemoteCommandError',
     'Result',

@@ -309,3 +309,147 @@ def test_a_dud_interpreter_does_not_fail_the_whole_probe():
 
 def test_a_dangling_venv_does_not_fail_the_whole_probe():
     assert venv._inspect_query(['/home/u/.venvs/dead']).rstrip().endswith('|| true')
+
+
+# -- creating virtual environments ----------------------------------------
+#
+# `python -m venv` writes into an existing directory without complaint and
+# exits 0, so every guard here is tether's own. That is what most of these
+# pin: not that creation works, but that it declines when it should.
+
+
+class CreateRemote(VenvRemote):
+    """A transport for creation: what is at the target, and what runs after."""
+
+    def __init__(self, present=False, existing='', after='', interpreters=''):
+        super().__init__()
+        self.present, self.existing, self.after = present, existing, after
+        self.interpreters = interpreters
+        self.created = False
+
+    def __call__(self, command):
+        self.commands.append(command)
+        if '-m venv' in command:
+            self.created = True
+            return ''
+        if command.startswith('[ -e '):
+            return ('present\n' if self.present else 'absent\n') + self.existing
+        if 'conda-meta' in command:                 # interpreters identifying themselves
+            return self.interpreters
+        if 'PATH' in command:                       # the PATH walk that finds them
+            return self.candidates
+        if '-c ' in command:                        # the venv describing itself
+            return self.after if self.created else self.existing
+        return ''
+
+
+def test_an_empty_target_is_created_and_described():
+    remote = CreateRemote(after='/venvs/a\t3.12.1\t/usr\n')
+    got = venv.create(remote, 'a', '/venvs')
+    assert (got.path, got.version, got.base) == ('/venvs/a', '3.12.1', '/usr')
+    assert remote.created
+
+
+def test_an_existing_working_venv_is_adopted_without_creating():
+    remote = CreateRemote(present=True, existing='/venvs/a\t3.8.10\t/usr\n')
+    got = venv.create(remote, 'a', '/venvs')
+    assert got.version == '3.8.10'
+    assert not remote.created
+
+
+def test_adoption_can_be_refused():
+    remote = CreateRemote(present=True, existing='/venvs/a\t3.8.10\t/usr\n')
+    with pytest.raises(tether.VenvError, match='already at'):
+        venv.create(remote, 'a', '/venvs', adopt_if_exists=False)
+    assert not remote.created
+
+
+def test_a_directory_that_is_not_a_venv_is_never_written_into():
+    """`python -m venv` would scatter bin/ and pyvenv.cfg beside someone's
+    files and exit 0. This is the only thing standing in the way."""
+    remote = CreateRemote(present=True, existing='')
+    with pytest.raises(tether.VenvError, match='is not a virtual environment'):
+        venv.create(remote, 'thesis', '/home/u')
+    assert not remote.created
+
+
+@pytest.mark.parametrize('name', ['', '../elsewhere', 'a/b', '/abs'])
+def test_a_name_that_would_escape_its_base_is_refused(name):
+    remote = CreateRemote()
+    with pytest.raises(tether.VenvError, match='usable environment name'):
+        venv.create(remote, name, '/venvs')
+    assert not remote.created
+
+
+# -- choosing the interpreter ---------------------------------------------
+
+
+def test_no_python_asked_for_costs_no_discovery():
+    """`python3` is whatever PATH says once setup has run."""
+    remote = CreateRemote(after='/venvs/a\t3.8.10\t/usr\n')
+    venv.create(remote, 'a', '/venvs')
+    assert any('python3 -m venv' in c for c in remote.commands)
+    assert not any('PATH' in c for c in remote.commands)
+
+
+def test_an_absolute_path_is_used_as_given():
+    remote = CreateRemote(after='/venvs/a\t3.12.1\t/usr\n')
+    venv.create(remote, 'a', '/venvs', python='/opt/py/bin/python3.12')
+    assert any('/opt/py/bin/python3.12 -m venv' in c for c in remote.commands)
+    assert not any('PATH' in c for c in remote.commands)
+
+
+def test_a_version_prefix_is_matched_against_what_is_installed():
+    remote = CreateRemote(
+        after='/venvs/a\t3.12.13\t/usr\n',
+        interpreters='/usr/bin/python3.12\t3.12.13\tFalse\tFalse\n',
+    )
+    remote.candidates = '/usr/bin/python3.12\t/usr/bin/python3.12\n'
+    venv.create(remote, 'a', '/venvs', python='3.12')
+    assert any('/usr/bin/python3.12 -m venv' in c for c in remote.commands)
+
+
+def test_a_version_that_is_not_installed_fails_before_the_shell_does():
+    """The shell's answer would be a command-not-found; this one names what
+    is actually available."""
+    remote = CreateRemote(interpreters='/usr/bin/python3.8\t3.8.10\tFalse\tFalse\n')
+    remote.candidates = '/usr/bin/python3.8\t/usr/bin/python3.8\n'
+    with pytest.raises(tether.VenvError, match='no python 3.12.*Available: 3.8.10'):
+        venv.create(remote, 'a', '/venvs', python='3.12')
+    assert not remote.created
+
+
+def test_the_error_points_at_the_way_out():
+    """terra has 3.12.13 under pyenv, off PATH -- exactly this case."""
+    remote = CreateRemote(interpreters='/usr/bin/python3.8\t3.8.10\tFalse\tFalse\n')
+    remote.candidates = '/usr/bin/python3.8\t/usr/bin/python3.8\n'
+    with pytest.raises(tether.VenvError, match='pre_activation_cmds'):
+        venv.create(remote, 'a', '/venvs', python='3.12')
+
+
+def test_a_prefix_matches_only_on_a_component_boundary():
+    """'3.1' must not match 3.12, which is a different python entirely."""
+    remote = CreateRemote(interpreters='/usr/bin/python3.12\t3.12.13\tFalse\tFalse\n')
+    remote.candidates = '/usr/bin/python3.12\t/usr/bin/python3.12\n'
+    with pytest.raises(tether.VenvError, match='no python 3.1\\b'):
+        venv.create(remote, 'a', '/venvs', python='3.1')
+
+
+# -- pip ------------------------------------------------------------------
+
+
+def test_pip_is_always_installed():
+    """A venv's only package manager is pip, so one without it could never
+    have anything put in it. There is deliberately no way to skip it."""
+    assert '--without-pip' not in venv._create_query('python3', '/venvs/a')
+
+
+def test_only_the_parent_is_created():
+    got = venv._create_query('python3', '/venvs/deep/a')
+    assert 'mkdir -p /venvs/deep' in got and 'mkdir -p /venvs/deep/a' not in got
+
+
+def test_creation_that_leaves_nothing_behind_is_an_error():
+    remote = CreateRemote(after='')
+    with pytest.raises(tether.VenvError, match='reported success'):
+        venv.create(remote, 'a', '/venvs')

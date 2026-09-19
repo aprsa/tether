@@ -24,7 +24,8 @@ import shlex
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from .shell import printf, remote_path
+from .errors import VenvError
+from .shell import printf, remote_path, run_or_abort
 
 #: Names an interpreter is plausibly reachable by: `python`, `python3`,
 #: `python3.12`, and the free-threaded `python3.13t`. Deliberately not
@@ -367,3 +368,146 @@ def _parse_config(stdout: str) -> dict[str, dict[str, str]]:
             current = blocks.setdefault(line.strip(), {})
 
     return blocks
+
+def create(
+    run: Callable[[str], str],
+    name: str,
+    venvs_base: str,
+    *,
+    python: str | None = None,
+    setup: str = '',
+    adopt_if_exists: bool = True,
+) -> VenvInstallation:
+    """Create `venvs_base/name`, and report what ended up there.
+
+    `python` picks the interpreter, and accepts three forms:
+
+    - `None` -- whatever `python3` resolves to once `setup` has run;
+    - a version prefix such as `'3.12'`, matched against what
+      `probe_interpreters()` finds, raising if nothing matches rather than
+      letting the shell fail later with something less explicable;
+    - an absolute path, used exactly as given and not second-guessed.
+
+    Unlike conda's installer, `python -m venv` does **not** refuse a target
+    that already exists -- it silently writes into it, exit code 0, even when
+    the directory is somebody's work. Tether therefore checks first:
+
+    - a working venv is there, and `adopt_if_exists`: adopted and returned;
+    - a working venv is there and it is not wanted: `VenvError`;
+    - anything else is there: `VenvError`, and nothing is touched.
+
+    pip is always installed, and there is no option to skip it: a venv's only
+    package manager *is* pip, so one without it could never have anything put
+    in it. Where `ensurepip` is missing -- Debian-family systems lacking the
+    `python3-venv` package -- creation fails, and Python's own message names
+    the package to install.
+    """
+    if not name or '/' in name:
+        raise VenvError(
+            f'{name!r} is not a usable environment name: it is placed inside '
+            f'{venvs_base}, so it must be a single directory name. Pass a '
+            f'different venvs_base to put it elsewhere'
+        )
+
+    path = posixpath.join(venvs_base.rstrip('/'), name)
+    present, existing = _parse_target(run(_target_query(path)))
+
+    if existing is not None:
+        if not adopt_if_exists:
+            raise VenvError(
+                f'a working virtual environment is already at {path}; pass '
+                f'adopt_if_exists=True to use it, or choose another name'
+            )
+        return existing
+
+    if present:
+        raise VenvError(
+            f'{path} exists but is not a virtual environment. `python -m venv` '
+            f'would write into it regardless, so tether will not: inspect it, '
+            f'move it, or choose another name'
+        )
+
+    interpreter = _resolve_interpreter(run, python, setup=setup)
+    run(_create_query(interpreter, path))
+
+    return _describe(run, path)
+
+
+def _resolve_interpreter(
+    run: Callable[[str], str],
+    python: str | None,
+    *,
+    setup: str = '',
+) -> str:
+    """The interpreter to build with, as something the shell can run.
+
+    A version prefix is the only form that costs a round trip, and the only
+    one that can fail here rather than later. That is deliberate: "3.12 is not
+    installed, these are" is a better answer than whatever the shell would say
+    about a command it could not find.
+    """
+    if python is None:
+        return 'python3'
+    if python.startswith(('/', '~')):
+        return remote_path(python)
+
+    available = probe_interpreters(run, setup=setup)
+    for found in available:
+        if found.version == python or found.version.startswith(f'{python}.'):
+            return remote_path(found.path)
+
+    offered = ', '.join(sorted({i.version for i in available})) or 'none'
+    raise VenvError(
+        f'no python {python} on PATH here. Available: {offered}. An '
+        f'interpreter that is installed but not on PATH can be put there from '
+        f'pre_activation_cmds, or named by its full path'
+    )
+
+
+def _create_query(interpreter: str, path: str) -> str:
+    """Command creating the venv, and the directory it belongs in.
+
+    Only the parent is created. The target must not exist -- not because the
+    tool would object, it would not, but because tether has already decided
+    that writing into an existing directory is never what was meant.
+    """
+    parent = posixpath.dirname(path.rstrip('/')) or '.'
+
+    return '\n'.join((
+        run_or_abort(f'mkdir -p {remote_path(parent)}',
+                     f'could not create {parent}'),
+        run_or_abort(f'{interpreter} -m venv {remote_path(path)}',
+                     f'could not create a virtual environment at {path}'),
+    ))
+
+
+def _target_query(path: str) -> str:
+    """Command reporting whether anything is at `path`, and whether it runs.
+
+    Existence and usability are different questions with different answers --
+    a directory can be there and be useless, which is the case tether refuses
+    to write into.
+    """
+    at = remote_path(path)
+    return '\n'.join((
+        f'[ -e {at} ] && echo present || echo absent',
+        _inspect_query([path]),
+    ))
+
+
+def _parse_target(stdout: str) -> tuple[bool, VenvInstallation | None]:
+    """(something is at the path, the venv it is if it runs)."""
+    present = 'present' in stdout.split()
+    found = _parse_inspect(stdout)
+    return present, found[0] if found else None
+
+
+def _describe(run: Callable[[str], str], path: str) -> VenvInstallation:
+    """What is at `path` once it has been created."""
+    found = _parse_inspect(run(_inspect_query([path])))
+    if not found:
+        raise VenvError(
+            f'`python -m venv` reported success but nothing that runs as a '
+            f'virtual environment is at {path}'
+        )
+    return found[0]

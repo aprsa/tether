@@ -364,6 +364,34 @@ class Server:
             include_broken=include_broken,
         )
 
+    def create_venv(
+        self,
+        name: str,
+        venvs_base: str | None = None,
+        *,
+        python: str | None = None,
+        adopt_if_exists: bool = True,
+    ) -> VenvInstallation:
+        """Create a virtual environment, and report what ended up there.
+
+        Lands at `<venvs_base>/<name>`, where `venvs_base` defaults to
+        `<workdir>/venvs` -- the same place `probe_venvs()` looks by default,
+        so anything created here is discoverable afterwards.
+
+        The environment's `pre_activation()` runs first, which is how an
+        interpreter that only exists after `module load python/3.12` can be
+        used at all. See `venv.create()` for what `python` accepts and for
+        what happens when the target is already occupied.
+        """
+        return _venv.create(
+            lambda command: self.run(command, check=True).stdout,
+            name,
+            venvs_base or self.path('venvs'),
+            python=python,
+            setup=_environment.pre_activation(self.environment),
+            adopt_if_exists=adopt_if_exists,
+        )
+
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.
 
