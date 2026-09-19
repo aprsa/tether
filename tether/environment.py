@@ -29,6 +29,7 @@ from its cause.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Iterable
 from dataclasses import MISSING, dataclass, field, fields
 from enum import StrEnum
 from typing import ClassVar
@@ -116,6 +117,31 @@ class Environment:
         """
         return list(self.post_activation_cmds)
 
+    def install_command(self, packages: Iterable[str]) -> str:
+        """Command installing `packages` into this environment.
+
+        pip for every kind, including conda's. `conda install` would be the
+        idiomatic choice for a conda environment, but it can only offer what
+        conda-forge carries -- and PHOEBE, the reason this library exists, is
+        published on PyPI alone. One mechanism that always works beats two that
+        each sometimes do.
+
+        `python -m pip` rather than `pip`, so the interpreter the preamble
+        activated is the one that installs. A stale `pip` shim earlier on PATH
+        would otherwise install somewhere nobody asked for.
+
+        Specifiers are quoted, which matters more than it looks: unquoted,
+        `numpy>=1.20` is a redirection and creates a file called `=1.20`.
+        """
+        wanted = [p for p in packages if p]
+        if not wanted:
+            raise ConfigError('install() needs at least one package')
+
+        return run_or_abort(
+            'python -m pip install ' + ' '.join(shlex.quote(p) for p in wanted),
+            f'could not install {", ".join(wanted)}',
+        )
+
     def preamble(self) -> str:
         """Every slot, in order, as one shell script: the whole of what runs
         ahead of the payload."""
@@ -174,6 +200,19 @@ class SystemEnvironment(Environment):
     """Bare metal: whatever the login shell already provides."""
 
     kind: ClassVar[EnvironmentKind] = EnvironmentKind.NONE
+
+    def install_command(self, packages: Iterable[str]) -> str:
+        """Refused. Bare metal has nothing isolated to install into.
+
+        The alternatives are both wrong by default: installing into the system
+        python needs root and changes what every other user gets, and `--user`
+        quietly puts packages somewhere that leaks into every later job. Make
+        a venv or a conda environment, or use `run()` and own the consequences.
+        """
+        raise ConfigError(
+            f"environment '{self.name}' is bare metal, so there is nothing to "
+            f'install into. Create a venv or a conda environment first'
+        )
 
 
 @dataclass(frozen=True)
@@ -323,3 +362,13 @@ def preamble(environment: Environment | None) -> str:
 
 def with_preamble(environment: Environment | None, command: str) -> str:
     return environment.with_preamble(command) if environment else command
+
+
+def install_command(environment: Environment | None, packages: Iterable[str]) -> str:
+    """`install_command()`, or a refusal if no environment is configured."""
+    if environment is None:
+        raise ConfigError(
+            'no environment is configured on this server, so there is nothing '
+            'to install into'
+        )
+    return environment.install_command(packages)

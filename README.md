@@ -164,6 +164,7 @@ srv1.install_conda()                              # <workdir>/conda
 srv2.probe_interpreters()
 srv2.create_venv('analysis', python='3.12')       # raises if 3.12 is not on PATH
 srv2.probe_venvs('~/.venvs', include_broken=True)
+srv2.install('phoebe')                            # pip, inside the activated env
 ```
 
 Both installers are idempotent: an existing, *working* installation is adopted
@@ -175,6 +176,11 @@ tether stands between a mistyped path and someone's working directory.
 `probe_venvs()` is told where to look rather than searching, because venv keeps
 no registry to ask and the filesystem is the wrong place to guess: on terra,
 `find $HOME` costs 22 seconds at the depth where venvs actually live.
+
+`install()` uses pip for every kind, conda environments included. `conda
+install` would be idiomatic there but can only offer what conda-forge carries,
+and PHOEBE is published on PyPI alone. Bare metal refuses: installing into the
+system python needs root, and `--user` leaks into every later job.
 
 **Verify before you depend on it.** `verify_environment()` activates and reports
 what came back, so a broken environment is caught before a job is built on it:
@@ -287,8 +293,6 @@ which is caught internally.
 
 Environments are done; running things is not. Deliberately deferred:
 
-- `install(packages)` into an environment tether created — pip for venvs,
-  conda for conda environments
 - `submit()` and file staging into per-job directories
 - `sacct` for finished jobs, plus an exit-code sentinel written into the job
   directory so completion survives `sacct` retention policy

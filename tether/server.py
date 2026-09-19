@@ -392,6 +392,22 @@ class Server:
             adopt_if_exists=adopt_if_exists,
         )
 
+    def install(self, *packages: str) -> None:
+        """Install `packages` into this server's configured environment.
+
+        Runs inside the activated environment, so the interpreter the preamble
+        selected is the one that receives them. pip is used for every kind --
+        see `Environment.install_command()` for why conda environments are no
+        exception.
+
+        Raises rather than installing anywhere surprising: bare metal and an
+        unconfigured server both refuse, since neither has anything isolated
+        to install into.
+        """
+        command = _environment.install_command(self.environment, packages)
+        self.run(command, environment=True, check=True)
+
+
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.
 

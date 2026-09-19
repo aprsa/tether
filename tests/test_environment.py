@@ -7,6 +7,7 @@ the emitted shell rather than on internal structure.
 
 import json
 import pathlib
+import re
 import shlex
 import subprocess
 
@@ -351,3 +352,67 @@ def test_each_kind_ignores_the_other_kind_variable():
     conda = env(kind=EnvironmentKind.CONDA)
     assert venv.activation_failure({'CONDA_PREFIX': '/opt/conda'}) is not None
     assert conda.activation_failure({'VIRTUAL_ENV': '/opt/venv'}) is not None
+
+
+# -- installing into an environment ---------------------------------------
+#
+# pip for every kind, including conda's: `conda install` can only offer what
+# conda-forge carries, and PHOEBE is published on PyPI alone.
+
+
+def install_command(cfg, *packages):
+    return tether.environment.install_command(cfg, packages)
+
+
+def test_a_venv_is_installed_into_with_pip():
+    got = install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'), 'phoebe')
+    assert 'python -m pip install phoebe' in got
+
+
+def test_a_conda_environment_is_too():
+    """`conda install` would be idiomatic and would not find phoebe."""
+    got = install_command(env(kind=EnvironmentKind.CONDA), 'phoebe')
+    assert 'python -m pip install phoebe' in got
+
+
+def test_pip_is_reached_through_the_interpreter():
+    """A stale `pip` shim earlier on PATH would install somewhere else."""
+    got = install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'), 'phoebe')
+    assert 'python -m pip' in got
+    assert not re.search(r'(^|[;&|]\s*)pip install', got)
+
+
+def test_a_failed_install_aborts_rather_than_continuing():
+    got = install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'), 'phoebe')
+    assert 'could not install phoebe' in got and 'exit 1' in got
+
+
+@pytest.mark.parametrize('spec', ['numpy>=1.20', 'phoebe[all]', 'a<2', 'x;y', 'a b'])
+def test_specifiers_are_quoted(spec):
+    """Unquoted, `numpy>=1.20` is a redirection that creates a file `=1.20`."""
+    got = install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'), spec)
+    assert shlex.quote(spec) in got
+
+
+def test_bare_metal_refuses():
+    """Installing into the system python needs root; --user leaks into every
+    later job. Neither is a sane default."""
+    with pytest.raises(tether.ConfigError, match='bare metal'):
+        install_command(env(), 'phoebe')
+
+
+def test_an_unconfigured_server_refuses():
+    with pytest.raises(tether.ConfigError, match='no environment is configured'):
+        install_command(None, 'phoebe')
+
+
+def test_installing_nothing_is_a_mistake():
+    with pytest.raises(tether.ConfigError, match='at least one package'):
+        install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'))
+
+
+def test_empty_specifiers_are_not_silently_installed():
+    """`install(*names)` with a blank in the list would otherwise run a bare
+    `pip install` and succeed, having installed nothing."""
+    with pytest.raises(tether.ConfigError, match='at least one package'):
+        install_command(env(kind=EnvironmentKind.VENV, path='/opt/v'), '', '')
