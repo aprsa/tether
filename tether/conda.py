@@ -15,20 +15,22 @@ awkward cases testable: a half-installed conda, an environment carrying its own
 `conda-meta`, a login banner in the output, a base that will not name its
 version. None of those need a machine that has one.
 
-`probe()` takes the transport as an argument rather than reaching for a
-connection, so the whole algorithm -- round trips included -- is exercisable
+`probe()` and `install()` take the transport as an argument -- `run`, which
+answers a command with its stdout -- rather than reaching for a connection, so the whole algorithm -- round trips included -- is exercisable
 with a dictionary.
 """
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
+import shlex
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
-from .errors import RemoteCommandError
-from .shell import printf, remote_path
+from .errors import CondaError, RemoteCommandError
+from .shell import printf, remote_path, run_or_abort
 
 #: What a version is when the installation would not say.
 UNKNOWN = 'unknown'
@@ -87,8 +89,9 @@ def probe(
     """Every conda installation `run` can reach, and its environments.
 
     `run` takes a command and returns its stdout, raising `RemoteCommandError`
-    if it fails -- `Server.probe_conda()` passes its own. `workdir_conda` is
-    where tether installs its own.
+    if it fails -- note that this is stdout, not the `Result` that `Server.run`
+    and `Link.run` hand back; `Server.probe_conda()` passes an adapter.
+    `workdir_conda` is where tether installs its own.
 
     `setup` is shell that runs before the lookups -- typically an
     `Environment`'s `pre_activation()`, which is what makes a conda visible when
@@ -104,29 +107,261 @@ def probe(
     here to point `conda_base` at; one that is both off PATH and unrecorded is
     what `conda_base` and `pre_activation_cmds` are for.
     """
-    bases = _parse_search(run(_search(workdir_conda, setup=setup)))
+    bases = _parse_search(run(_search_query(workdir_conda, setup=setup)))
     if not bases:
         return []
 
-    found = _parse_listing(run(_listing(bases)))
+    return _resolve_versions(run, _parse_listing(run(_listing_query(bases))))
 
+
+def _resolve_versions(
+    run: Callable[[str], str],
+    found: list[CondaInstallation],
+) -> list[CondaInstallation]:
+    """Fill in versions that `conda-meta` would not give up, the slow way.
+
+    Only a base that failed to name itself pays for an interpreter launch, and
+    one that cannot even run `conda --version` keeps `unknown` rather than
+    raising -- it is already known to be odd, and that is the answer.
+    """
     for index, installation in enumerate(found):
         if installation.version != UNKNOWN:
             continue
         try:
             version = _parse_version(run(_version_query(installation.base)))
         except RemoteCommandError:
-            continue        # already known to be odd; unknown is the answer
+            continue
         found[index] = replace(installation, version=version)
 
     return found
 
 
-def _search(workdir_conda: str | None = None, *, setup: str = '') -> str:
+#: Miniforge rather than Miniconda: the `defaults` channel carries licence
+#: terms that nobody can meaningfully accept on a shared cluster's behalf,
+#: and conda-forge has none. The API is used rather than a download URL so
+#: that assets are *discovered* -- see `_parse_release()`.
+_MINIFORGE = 'https://api.github.com/repos/conda-forge/miniforge'
+
+#: Long enough for 124MB over a slow link, short enough to fail before a
+#: batch allocation expires.
+_DOWNLOAD_TIMEOUT = 600
+
+
+def install(
+    run: Callable[[str], str],
+    prefix: str,
+    *,
+    version: str | None = None,
+    installer: str | None = None,
+    sha256: str | None = None,
+    adopt_if_exists: bool = True,
+) -> CondaInstallation:
+    """Put a working conda at `prefix`, and report what ended up there.
+
+    `run` is the same transport `probe()` takes: a command in, its stdout back.
+
+    `prefix` must not already exist -- the installer refuses to write into a
+    directory that does, and tether never removes anything. What happens when
+    something *is* there depends on whether it works:
+
+    - it activates, and `adopt_if_exists`: adopted and returned, nothing
+      installed. This is what makes calling `install()` twice harmless.
+    - it activates, and not `adopt_if_exists`: `CondaError`, since the
+      alternative would be to destroy a working installation.
+    - it does not activate: `CondaError`. A half-extracted tree is exactly
+      what you do not want silently overwritten, and only a person can know
+      whether it is safe to delete.
+
+    `version` is a Miniforge release tag such as `'26.7.2-0'`, not a conda
+    version -- they usually coincide, but the returned `CondaInstallation`
+    reports what `conda-meta` says, which is conda's own. Omit it for the
+    latest release.
+
+    `installer` is a path to an installer already on the remote, skipping the
+    download entirely. It is trusted as given unless `sha256` accompanies it,
+    which is the escape hatch for a site that mirrors the installer behind a
+    firewall and publishes its own hash.
+
+    A downloaded installer lands beside `prefix`, and is removed once it has
+    run. It is deliberately kept when anything fails, so a bad download can
+    be examined rather than silently fetched again.
+    """
+    present, active = _parse_state(run(_state_query(prefix)))
+
+    if active:
+        if not adopt_if_exists:
+            raise CondaError(
+                f'a working conda is already installed at {prefix}; pass '
+                f'adopt_if_exists=True to use it, or choose another prefix'
+            )
+        return _describe(run, prefix)
+
+    if present:
+        raise CondaError(
+            f'{prefix} exists but does not activate, so it is not a usable '
+            f'conda installation. tether will not remove it: inspect it, '
+            f'delete it by hand, or install somewhere else'
+        )
+
+    downloaded = None
+    if installer is None:
+        arch = run('uname -m').strip()
+        url, checksum_url = _parse_release(run(_release_query(version)), arch)
+        downloaded = posixpath.join(_parent(prefix), posixpath.basename(url))
+        run(_download(url, downloaded))
+        expected = _parse_sha256(run(_fetch(checksum_url)))
+        installer = downloaded
+    else:
+        expected = sha256
+
+    if expected:
+        actual = _parse_sha256(run(_sha256_query(installer)))
+        if actual != expected:
+            raise CondaError(
+                f'checksum mismatch for {installer}: expected {expected}, got '
+                f'{actual or "nothing"}. The file has been left in place'
+            )
+
+    run(_install_command(installer, prefix))
+
+    if downloaded:                      # only ever remove what we fetched
+        run(f'rm -f {remote_path(downloaded)}')
+
+    return _describe(run, prefix)
+
+
+def _parent(path: str) -> str:
+    """The directory `path` will be created in."""
+    return posixpath.dirname(path.rstrip('/')) or '.'
+
+
+def _release_query(version: str | None) -> str:
+    """Command fetching one release's metadata, latest unless `version` says."""
+    url = (f'{_MINIFORGE}/releases/latest' if version is None
+           else f'{_MINIFORGE}/releases/tags/{version}')
+    return _fetch(url)
+
+
+def _fetch(url: str) -> str:
+    """Command printing what is at `url`, failing loudly on a bad status."""
+    return f'curl -fsSLm 60 {shlex.quote(url)}'
+
+
+def _parse_release(stdout: str, arch: str) -> tuple[str, str]:
+    """The installer URL for `arch`, and the URL of its checksum.
+
+    Discovery, not construction. The release lists its own assets, so a change
+    in Miniforge's naming surfaces here as "no asset matched" rather than as a
+    404 on a URL we invented -- and the two are found together or not at all,
+    because only the version-stamped filename is checksummed. The unversioned
+    convenience alias `Miniforge3-Linux-x86_64.sh` has no `.sha256` at any
+    URL, which is why it is never chosen.
+    """
+    try:
+        release = json.loads(stdout)
+        tag = release['tag_name']
+        assets = {a['name']: a['browser_download_url'] for a in release['assets']}
+    except (TypeError, KeyError, ValueError) as exc:
+        raise CondaError(
+            f'could not read the Miniforge release listing ({exc}); '
+            f'pass installer= to skip the download entirely'
+        ) from None
+
+    suffix = f'-Linux-{arch}.sh'
+    for name in sorted(assets):
+        if name.endswith(suffix) and tag in name and f'{name}.sha256' in assets:
+            return assets[name], assets[f'{name}.sha256']
+
+    offered = ', '.join(sorted(n for n in assets if n.endswith('.sh'))) or 'none'
+    raise CondaError(
+        f'Miniforge {tag} publishes no checksummed installer for Linux-{arch}. '
+        f'Installers offered: {offered}'
+    )
+
+
+def _download(url: str, dest: str) -> str:
+    """Command fetching `url` to `dest`, creating the directory it needs."""
+    return '\n'.join((
+        run_or_abort(f'mkdir -p {remote_path(_parent(dest))}',
+                     f'could not create {_parent(dest)}'),
+        run_or_abort(
+            f'curl -fsSLm {_DOWNLOAD_TIMEOUT} -o {remote_path(dest)} {shlex.quote(url)}',
+            f'could not download {url}',
+        ),
+    ))
+
+
+def _sha256_query(path: str) -> str:
+    """Command printing the checksum of a file already on the remote."""
+    return f'sha256sum {remote_path(path)}'
+
+
+def _parse_sha256(stdout: str) -> str:
+    """The hex digest out of `<hex>  <name>`.
+
+    Both `sha256sum` and a published `.sha256` file use that shape, so one
+    parser reads the expected value and the actual one -- and the comparison
+    happens in Python, where a mismatch can say what it expected and what it
+    got. `sha256sum -c` would only say FAILED, and would additionally require
+    the download to carry the exact filename the checksum file names.
+    """
+    fields = stdout.split()
+    return fields[0] if fields else ''
+
+
+def _install_command(installer: str, prefix: str) -> str:
+    """Command running the installer non-interactively into `prefix`.
+
+    `-b` is batch (no prompts, no licence pager), `-p` is the prefix. The
+    installer refuses a prefix that already exists, which is the behaviour
+    tether wants, so only the *parent* is created here.
+    """
+    return '\n'.join((
+        run_or_abort(f'mkdir -p {remote_path(_parent(prefix))}',
+                     f'could not create {_parent(prefix)}'),
+        run_or_abort(f'bash {remote_path(installer)} -b -p {remote_path(prefix)}',
+                     f'the Miniforge installer failed for {prefix}'),
+    ))
+
+
+def _state_query(prefix: str) -> str:
+    """Command reporting whether anything is at `prefix`, and whether it works.
+
+    Activation is the test rather than a directory listing, because a tree can
+    look exactly like conda and still not run. What the caller needs to know
+    is not "does this resemble conda" but "can this be used", and only trying
+    it answers that.
+    """
+    at = remote_path(prefix)
+    return (
+        f'[ -e {at} ] && echo present || echo absent\n'
+        f'if . {at}/etc/profile.d/conda.sh >/dev/null 2>&1 && '
+        f'conda activate base >/dev/null 2>&1; then echo active; fi'
+    )
+
+
+def _parse_state(stdout: str) -> tuple[bool, bool]:
+    """(something is at the prefix, it activates)."""
+    words = stdout.split()
+    return 'present' in words, 'active' in words
+
+
+def _describe(run: Callable[[str], str], prefix: str) -> CondaInstallation:
+    """What is at `prefix`, described the same way `probe()` describes things."""
+    found = _resolve_versions(run, _parse_listing(run(_listing_query([prefix]))))
+    if not found:
+        raise CondaError(
+            f'the installer reported success but nothing that looks like a '
+            f'conda installation is at {prefix}'
+        )
+    return found[0]
+
+
+def _search_query(workdir_conda: str | None = None, *, setup: str = '') -> str:
     """Shell that prints paths which might belong to a conda installation.
 
     This only gathers; it decides nothing. What the paths mean is
-    `_parse_search()`'s problem, and whether they exist is `_listing()`'s.
+    `_parse_search()`'s problem, and whether they exist is `_listing_query()`'s.
     """
     sources = [*_SOURCES]
     if workdir_conda:
@@ -160,7 +395,7 @@ def _parse_search(stdout: str) -> tuple[str, ...]:
     return tuple(bases)
 
 
-def _listing(bases: Iterable[str]) -> str:
+def _listing_query(bases: Iterable[str]) -> str:
     """Shell that dumps the facts about `bases` that identify installations.
 
     One `ls` over a set of globs -- the activation hook, the `conda-meta` entry
@@ -188,7 +423,7 @@ def _listing(bases: Iterable[str]) -> str:
 
 
 def _parse_listing(stdout: str) -> list[CondaInstallation]:
-    """Assemble `_listing()` output into the installations it describes.
+    """Assemble `_listing_query()` output into the installations it describes.
 
     Bases are collected first, from the activation hook alone, so that an
     environment is never mistaken for one. Environments under `~/.conda` are
@@ -225,7 +460,7 @@ def _parse_listing(stdout: str) -> list[CondaInstallation]:
 def _version_query(base: str) -> str:
     """Shell that asks a conda for its own version -- the expensive way.
 
-    Worth running only when `_listing()` could not read the version off a
+    Worth running only when `_listing_query()` could not read the version off a
     `conda-meta` filename, since this launches a Python interpreter.
     """
     return f'{remote_path(base)}/bin/conda --version'

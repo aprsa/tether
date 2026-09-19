@@ -36,6 +36,10 @@ class RemoteCommandError(TetherError):
         )
 
 
+class CondaError(TetherError):
+    """Conda could not be installed, or was found in an unusable state."""
+
+
 class SlurmError(TetherError):
     """Slurm is absent, or present and disagreed with us."""
 

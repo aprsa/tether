@@ -29,6 +29,7 @@ from .environment import (
     env,
 )
 from .errors import (
+    CondaError,
     EnvActivationError,
     ConfigError,
     RemoteCommandError,
@@ -45,6 +46,7 @@ __version__ = '0.1.0'
 __all__ = [
     'EnvActivationError',
     'CondaInstallation',
+    'CondaError',
     'ConfigError',
     'Environment',
     'EnvironmentInfo',

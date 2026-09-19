@@ -285,15 +285,44 @@ class Server:
     def probe_conda(self) -> list[CondaInstallation]:
         """Every conda installation this account can reach, and its environments.
 
-        Delegates to `conda.probe()`, handing it this server's `run` and the
-        environment's own `pre_activation()` -- so a conda that only appears once
-        `module load anaconda` has run is found. See that function for what is
-        searched, what is deliberately not, and why.
+        Delegates to `conda.probe()`, handing it this server's own `run`
+        adapted to return stdout, and the environment's `pre_activation()` --
+        so a conda that only appears once `module load anaconda` has run is
+        found.
+        See that function for what is searched, what is deliberately not, and
+        why.
         """
         return _conda.probe(
             lambda command: self.run(command, check=True).stdout,
             self.path('conda'),
             setup=_environment.pre_activation(self.environment),
+        )
+
+    def install_conda(
+        self,
+        prefix: str | None = None,
+        *,
+        version: str | None = None,
+        installer: str | None = None,
+        sha256: str | None = None,
+        adopt_if_exists: bool = True,
+    ) -> CondaInstallation:
+        """Install a conda that tether owns, and report what ended up there.
+
+        Defaults to `<workdir>/conda`, which is also where `probe_conda()`
+        looks -- so a default installation is discoverable afterwards
+        without configuring anything.
+
+        Calling this twice is harmless: the second call finds a working conda
+        and adopts it. See `conda.install()` for further details.
+        """
+        return _conda.install(
+            lambda command: self.run(command, check=True).stdout,
+            prefix or self.path('conda'),
+            version=version,
+            installer=installer,
+            sha256=sha256,
+            adopt_if_exists=adopt_if_exists,
         )
 
     def verify_environment(self) -> EnvironmentInfo:
