@@ -40,7 +40,7 @@ from .errors import (
 )
 from .venv import PythonInstallation, VenvInstallation
 from .server import EnvironmentInfo, Host, Server, SlurmServer, server
-from .slurm import Job, Partition, parse_duration
+from .slurm import Job, Partition, Submission, parse_duration
 from .link import Result, Link
 
 __version__ = '0.1.0'
@@ -67,6 +67,7 @@ __all__ = [
     'Server',
     'ServerKind',
     'SlurmError',
+    'Submission',
     'SlurmServer',
     'TetherError',
     'Link',

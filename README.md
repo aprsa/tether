@@ -116,7 +116,7 @@ Fields belonging to another kind are refused because they are not fields on that
 The generated shell runs in a fixed order:
 
 | Slot | What it is for |
-|---|---|
+| --- | --- |
 | `pre_activation_cmds` | Verbatim lines, first. Makes the machinery available. |
 | `modules` | `module load` each entry, in order |
 | `env` | `export` each variable — before activation, so vars that *configure* activation take effect |
@@ -207,6 +207,37 @@ Environment variable *values* are quoted, so they are literal: `env` cannot refe
 
 `mpirun` is parsed but inert until job submission lands.
 
+## Jobs
+
+`submit()` writes a batch script, sends it to `sbatch`, and gives back a record
+of what was sent.
+
+```python
+s = srv.submit('python fit.py', name='fit', cpus=8, time='02:00:00',
+               directives={'gres': 'gpu:1'})
+# 626 'fit' in /home/u/.tether/jobs/fit.20260919-184816 (cpus=8, time=02:00:00)
+```
+
+Everything about one job lives in one directory — the script as submitted,
+`stdout`, `stderr`, and the jobid. That directory is the handle: it is named
+before submission (the jobid does not exist until `sbatch` has already been told
+where to run), and it is what lets a later session pick the job up again.
+
+A second job of the same name in the same second gets an index —
+`fit.20260919-184816.2` — rather than taking the first one's directory over.
+The loop that finds the free name runs in the shell, because `mkdir` either
+creates or fails atomically; asking first and creating second would leave a
+window another submitter could step into.
+
+`Submission` is a record of the *request*, not of the job's state, so it does not
+go stale. Ask `job()` or `queue()` for what the job is doing now.
+
+**Slurm is the source of truth for state**, and the filesystem for artifacts.
+There is no exit-code sentinel: `sacct` records state and exit code durably
+wherever accounting is configured, and a second record would be a second truth.
+Where it is not configured, `scontrol` still answers for `MinJobAge` (300s by
+default) and the job directory still proves the job existed.
+
 ## Decisions worth knowing
 
 **One connection, many channels.** SSH multiplexes: each command is a channel on an already-authenticated link, so 50 commands cost one authentication. The SFTP client is held open for the same reason — each one spawns a subsystem channel and an `sftp-server` process remotely.
@@ -273,7 +304,7 @@ be `None` when `~/.ssh/config` supplies it.
 
 ## Exceptions
 
-```
+```ascii
 TetherError
 ├── ConfigError           bad or missing configuration
 ├── EnvActivationError    environment did not activate, or activated nowhere
@@ -293,13 +324,10 @@ which is caught internally.
 
 Environments are done; running things is not. Deliberately deferred:
 
-- `submit()` and file staging into per-job directories
-- `sacct` for finished jobs, plus an exit-code sentinel written into the job
-  directory so completion survives `sacct` retention policy
+- `job()` falling back to `sacct`, so a finished job stops looking like a
+  missing one
+- file staging into the job directory, and fetching results back out
 - `cancel()`, log streaming, reattach-by-directory
-
-`job()` returning `None` is currently ambiguous — "finished" and "never existed"
-are indistinguishable until `sacct` and sentinels land.
 
 ## Tests
 

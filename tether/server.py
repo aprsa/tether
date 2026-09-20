@@ -9,12 +9,15 @@ from __future__ import annotations
 import os
 import posixpath
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from . import conda as _conda
 from . import environment as _environment
+from . import shell as _shell
 from . import slurm as _slurm
 from . import venv as _venv
 from .config import DEFAULT_WORKDIR, ServerKind, _load_server, _save_server
@@ -23,7 +26,7 @@ from .environment import Environment
 from .venv import PythonInstallation, VenvInstallation
 from .errors import ConfigError, EnvActivationError, SlurmError
 from .shell import printf
-from .slurm import Job, Partition
+from .slurm import Job, Partition, Submission
 from .link import DEFAULT_KEEPALIVE, DEFAULT_TIMEOUT, Result, Link
 
 
@@ -407,7 +410,6 @@ class Server:
         command = _environment.install_command(self.environment, packages)
         self.run(command, environment=True, check=True)
 
-
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.
 
@@ -581,6 +583,81 @@ class SlurmServer(Server):
 
         jobs = _slurm.parse_squeue(result.stdout)
         return jobs[0] if jobs else None
+
+    def submit(
+        self,
+        payload: str,
+        *,
+        name: str = 'job',
+        partition: str | None = None,
+        nodes: int | None = None,
+        cpus: int | None = None,
+        time: str | None = None,
+        memory: str | None = None,
+        directives: Mapping[str, str] | None = None,
+        jobs_base: str | None = None,
+    ) -> Submission:
+        """Submit `payload` as a batch job, and report what was sent.
+
+        Everything about the job lands in one directory, `<jobs_base>/<name>.
+        <timestamp>`, defaulting to `<workdir>/jobs`. The script as submitted,
+        `stdout`, `stderr` and the jobid are all there, which is what lets a
+        later session pick the job up again -- and what keeps "finished long
+        ago" distinguishable from "never submitted" on a cluster whose Slurm
+        has since forgotten.
+
+        The environment's full `preamble()` runs inside the script, so a job
+        gets the environment an interactive `run()` would, guards included.
+
+        `directives` passes anything tether has not anticipated straight
+        through: `{'gres': 'gpu:1'}` becomes `#SBATCH --gres=gpu:1`.
+        """
+        base = jobs_base or self.path('jobs')
+        # Naive local time on purpose: this is a label for a human reading
+        # `ls`, never compared or converted. Uniqueness is enforced below, not
+        # by the clock.
+        directory = _slurm.job_directory(base, name, datetime.now())  # noqa: DTZ005
+        script = _slurm.batch_script(
+            payload,
+            name=name,
+            preamble=_environment.preamble(self.environment),
+            partition=partition,
+            nodes=nodes,
+            cpus=cpus,
+            time=time,
+            memory=memory,
+            directives=directives,
+        )
+
+        # The directory is claimed before anything is written into it, and
+        # may come back with an index: two jobs of one name in one second are
+        # the caller's business, not something to refuse or to conflate.
+        directory = _slurm.parse_claim(
+            self.run(_slurm.claim_command(directory), check=True).stdout
+        )
+        at = _shell.remote_path(directory)
+        self.run(
+            f'printf %s {shlex.quote(script)} > {at}/{_slurm.SCRIPT}', check=True
+        )
+
+        jobid = _slurm.parse_submit(
+            self.run(_slurm.submit_command(directory), check=True).stdout
+        )
+        # Written before anything can go wrong with it: the directory is how
+        # tether knows this job existed once Slurm no longer does.
+        self.run(f'printf %s {shlex.quote(jobid)} > {at}/{_slurm.JOBID}', check=True)
+
+        return Submission(
+            jobid=jobid,
+            directory=directory,
+            name=name,
+            partition=partition,
+            nodes=nodes,
+            cpus=cpus,
+            time=time,
+            memory=memory,
+            directives=tuple((directives or {}).items()),
+        )
 
 
 SERVERS: dict[ServerKind, type[Server]] = {

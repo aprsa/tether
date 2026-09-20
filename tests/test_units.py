@@ -2,12 +2,23 @@
 
 import json
 import pathlib
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 import tether
-from tether.slurm import parse_duration, parse_sinfo, parse_squeue
+from tether.slurm import (
+    batch_script,
+    check_name,
+    claim_command,
+    job_directory,
+    parse_claim,
+    parse_duration,
+    parse_sinfo,
+    parse_squeue,
+    parse_submit,
+    submit_command,
+)
 
 
 def write_server(config_dir, name='a', **body):
@@ -322,3 +333,174 @@ def test_lists_and_tuples_compare_equal(tmp_path):
     still equal the same one loaded back."""
     assert (tether.SystemEnvironment('a', modules=['gcc'])
             == tether.SystemEnvironment('a', modules=('gcc',)))
+
+
+# -- batch scripts ---------------------------------------------------------
+#
+# The script is the contract: someone will read it by hand while debugging a
+# job that failed at 3am, so these assert on the emitted text rather than on
+# internal structure.
+
+
+def test_a_job_owns_a_directory_named_before_it_has_an_id():
+    """`--chdir` needs a directory, and the jobid does not exist until sbatch
+    has already been told where to run."""
+    at = job_directory('~/.tether/jobs', 'fit', datetime(2026, 9, 19, 14, 30, 52, tzinfo=UTC))
+    assert at == '~/.tether/jobs/fit.20260919-143052'
+
+
+def test_a_trailing_slash_on_the_base_does_not_double():
+    assert job_directory('/jobs/', 'fit', datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)) == (
+        '/jobs/fit.20260102-030405'
+    )
+
+
+@pytest.mark.parametrize('name', ['fit', 'run-2', 'a.b', 'a_b', 'Fit9'])
+def test_usable_job_names(name):
+    check_name(name)
+
+
+@pytest.mark.parametrize('name', ['', 'a/b', '../escape', 'a b', 'a;b', 'a$b', '*'])
+def test_a_job_name_that_would_not_survive_being_a_directory(name):
+    with pytest.raises(tether.SlurmError, match='usable job name'):
+        check_name(name)
+
+
+def test_the_script_is_sbatch_then_environment_then_payload():
+    """The order is the whole point: directives are read before the job runs,
+    and the payload must not start before the environment is in place."""
+    got = batch_script('python run.py', name='fit', preamble='source /opt/v/bin/activate')
+    lines = [ln for ln in got.splitlines() if ln.strip()]
+    assert lines[0] == '#!/bin/bash'
+    assert lines.index('source /opt/v/bin/activate') > lines.index('#SBATCH --job-name=fit')
+    assert lines[-1] == 'python run.py'
+
+
+def test_options_not_asked_for_are_not_emitted():
+    """Absent means "Slurm's default", which is not the same as any value we
+    could invent for it."""
+    got = batch_script('true', name='fit')
+    for absent in ('--partition', '--nodes', '--cpus-per-task', '--time', '--mem'):
+        assert absent not in got
+
+
+def test_options_use_slurm_names_not_tether_ones():
+    got = batch_script('true', name='fit', cpus=8, memory='4G', nodes=2,
+                       partition='intel', time='01:00:00')
+    assert '#SBATCH --cpus-per-task=8' in got
+    assert '#SBATCH --mem=4G' in got
+    assert '#SBATCH --nodes=2' in got
+    assert '#SBATCH --partition=intel' in got
+    assert '#SBATCH --time=01:00:00' in got
+
+
+def test_output_lands_beside_the_script():
+    """Relative, because --chdir puts the job in its own directory."""
+    got = batch_script('true', name='fit')
+    assert '#SBATCH --output=stdout' in got and '#SBATCH --error=stderr' in got
+
+
+def test_unanticipated_directives_pass_straight_through():
+    got = batch_script('true', name='fit', directives={'gres': 'gpu:1', 'account': 'phoebe'})
+    assert '#SBATCH --gres=gpu:1' in got and '#SBATCH --account=phoebe' in got
+
+
+def test_a_valueless_directive_becomes_a_bare_flag():
+    got = batch_script('true', name='fit', directives={'exclusive': ''})
+    assert '#SBATCH --exclusive\n' in got
+    assert '--exclusive=' not in got
+
+
+def test_directive_values_are_not_quoted():
+    """`#SBATCH` lines are read by Slurm, not by a shell. Quoting them would
+    make the quotes part of the value."""
+    got = batch_script('true', name='fit', directives={'comment': 'a b'})
+    assert '#SBATCH --comment=a b' in got
+
+
+def test_no_environment_means_no_blank_preamble_section():
+    got = batch_script('true', name='fit')
+    assert '\n\n\n' not in got
+
+
+def test_a_multi_line_payload_is_kept_whole():
+    got = batch_script('one\ntwo\nthree', name='fit')
+    assert got.endswith('one\ntwo\nthree\n')
+
+
+def test_the_script_refuses_a_name_that_is_not_a_directory():
+    with pytest.raises(tether.SlurmError, match='usable job name'):
+        batch_script('true', name='../escape')
+
+
+# -- submitting ------------------------------------------------------------
+
+
+def test_submission_asks_for_a_parsable_answer_in_the_right_directory():
+    got = submit_command('/jobs/fit.20260919-143052')
+    assert '--parsable' in got
+    assert '--chdir=/jobs/fit.20260919-143052' in got
+    assert got.endswith('/job.sh')
+
+
+def test_a_directory_with_a_space_is_quoted():
+    got = submit_command('/my jobs/fit.1')
+    assert "'/my jobs/fit.1'" in got
+
+
+def test_the_job_id_comes_back_from_parsable():
+    assert parse_submit('12345\n') == '12345'
+
+
+def test_a_federated_cluster_suffix_is_dropped():
+    """`--parsable` prints `jobid;cluster` on a federation, and the cluster
+    name would poison every later lookup."""
+    assert parse_submit('12345;cluster\n') == '12345'
+
+
+@pytest.mark.parametrize('noise', ['', '\n', 'Submitted batch job 5\n', 'error: nope\n'])
+def test_anything_that_is_not_a_job_id_is_loud(noise):
+    with pytest.raises(tether.SlurmError, match='did not return a job id'):
+        parse_submit(noise)
+
+
+def test_a_submission_describes_itself_for_a_human():
+    s = tether.Submission(jobid='626', directory='/jobs/fit.1', name='fit', cpus=8)
+    assert str(s) == "626 'fit' in /jobs/fit.1 (cpus=8)"
+    bare = tether.Submission(jobid='1', directory='/j/a', name='a')
+    assert str(bare) == "1 'a' in /j/a"
+
+
+def test_a_directory_is_claimed_by_creating_it_not_by_checking_first():
+    """`mkdir` either creates or fails, atomically. Asking and then creating
+    would leave a window another submitter could step into."""
+    got = claim_command('/jobs/fit.1')
+    assert 'mkdir "$_tether_dir"' in got
+    assert '[ -e' not in got and '[ -d' not in got
+
+
+def test_the_first_job_of_a_name_gets_an_unsuffixed_directory():
+    got = claim_command('/jobs/fit.1')
+    assert '_tether_dir="$_tether_base"' in got
+
+
+def test_later_ones_are_indexed_rather_than_refused():
+    got = claim_command('/jobs/fit.1')
+    assert '_tether_dir="$_tether_base.$_tether_n"' in got
+
+
+def test_claiming_gives_up_rather_than_looping_forever():
+    """A parent that cannot be written to would otherwise spin."""
+    assert '-le 7 ]' in claim_command('/jobs/fit.1', limit=7)
+
+
+def test_the_claimed_directory_is_the_one_reported():
+    """It may carry an index nobody asked for, and everything after -- script,
+    --chdir, the Submission -- has to use that one."""
+    assert parse_claim('/jobs/fit.1.3\n') == '/jobs/fit.1.3'
+
+
+@pytest.mark.parametrize('noise', ['', '\n', '   \n'])
+def test_claiming_nothing_is_an_error_not_a_silent_reuse(noise):
+    with pytest.raises(tether.SlurmError, match='could not create a job directory'):
+        parse_claim(noise)

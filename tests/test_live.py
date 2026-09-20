@@ -799,3 +799,71 @@ def test_probe_finds_a_conda_at_the_workdir_prefix(plain):
         assert found[target].version != 'unknown'
     finally:
         plain.run(f'rm -f {target}')
+
+
+# -- submitting through Server.submit() -----------------------------------
+
+
+def test_a_submitted_job_runs_and_leaves_its_whole_record_behind(srv):
+    """Everything about the job in one directory -- which is what makes it
+    findable again in a later session, after Slurm has forgotten it."""
+    s = srv.submit('echo "ran on $(hostname)"', name='record', cpus=1, time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        assert set(srv.run(f'ls -1 {s.directory}', check=True).stdout.split()) == {
+            'job.sh', 'jobid', 'stdout', 'stderr',
+        }
+        assert 'ran on' in srv.run(f'cat {s.directory}/stdout', check=True).stdout
+        assert srv.run(f'cat {s.directory}/jobid', check=True).stdout.strip() == s.jobid
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_the_submission_records_what_was_asked_for(srv):
+    s = srv.submit('true', name='asked', cpus=2, time='00:03:00', nodes=1)
+    try:
+        assert (s.name, s.cpus, s.time, s.nodes) == ('asked', 2, '00:03:00', 1)
+        assert s.jobid.isdigit()
+        assert '/asked.' in s.directory
+    finally:
+        srv.run(f'scancel {s.jobid} 2>/dev/null; rm -rf {s.directory}', check=False)
+
+
+def test_two_jobs_of_one_name_in_one_second_get_a_directory_each(srv):
+    """`mkdir -p` would have succeeded on the existing directory and the second
+    job would have overwritten the first's script, jobid and output -- before
+    the first had even started. Refusing would have been tether deciding what
+    the caller meant, so the second is indexed instead."""
+    first = srv.submit('echo first', name='clash', time='00:02:00')
+    second = srv.submit('echo second', name='clash', time='00:02:00')
+    try:
+        assert first.directory != second.directory
+        assert second.directory.startswith(first.directory)
+
+        for sub, expected in ((first, 'echo first'), (second, 'echo second')):
+            wait_for(srv, sub.jobid)
+            kept = srv.run(f'cat {sub.directory}/job.sh', check=True).stdout
+            assert expected in kept
+            assert srv.run(f'cat {sub.directory}/jobid', check=True).stdout.strip() == sub.jobid
+    finally:
+        for sub in (first, second):
+            srv.run(f'rm -rf {sub.directory}', check=True)
+
+
+def test_the_environment_preamble_reaches_the_job(rig, tmp_path):
+    """A job gets the environment an interactive `run()` would."""
+    path = tmp_path / 'servers' / f'{ALIAS}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {'kind': 'slurm', 'environments': {'e': {'kind': 'venv', 'path': VENV}}}
+    ))
+    srv = tether.SlurmServer(
+        ALIAS, ssh_config=rig, config_dir=str(tmp_path), environment='e'
+    )
+    s = srv.submit('python -c "import sys; print(sys.prefix)"', name='envjob', time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        assert VENV in srv.run(f'cat {s.directory}/stdout', check=True).stdout
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+        srv.close()
