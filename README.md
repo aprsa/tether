@@ -163,6 +163,7 @@ srv1.install_conda()                              # <workdir>/conda
 
 srv2.probe_interpreters()
 srv2.create_venv('analysis', python='3.12')       # raises if 3.12 is not on PATH
+srv1.create_conda_env('phoebe', python='3.12')   # -> the prefix it landed in
 srv2.probe_venvs('~/.venvs', include_broken=True)
 srv2.install('phoebe')                            # pip, inside the activated env
 ```
@@ -176,6 +177,11 @@ tether stands between a mistyped path and someone's working directory.
 `probe_venvs()` is told where to look rather than searching, because venv keeps
 no registry to ask and the filesystem is the wrong place to guess: on terra,
 `find $HOME` costs 22 seconds at the depth where venvs actually live.
+
+`create_conda_env()` returns the prefix rather than letting you assume one:
+conda puts a named environment under the base when the base is writable and in
+`~/.conda/envs` when it is not, which is the usual outcome against a site-wide
+installation.
 
 `install()` uses pip for every kind, conda environments included. `conda
 install` would be idiomatic there but can only offer what conda-forge carries,

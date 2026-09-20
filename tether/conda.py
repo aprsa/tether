@@ -470,3 +470,108 @@ def _parse_version(stdout: str) -> str:
     """`conda --version` prints `conda <version>`; anything else is unknown."""
     parts = stdout.split()
     return parts[1] if len(parts) == 2 and parts[0] == 'conda' else UNKNOWN
+
+def create_env(
+    run: Callable[[str], str],
+    name: str,
+    base: str,
+    *,
+    python: str | None = None,
+    packages: Iterable[str] = (),
+    setup: str = '',
+    adopt_if_exists: bool = True,
+) -> str:
+    """Create the conda environment `name` under `base`, and say where it landed.
+
+    Where it lands is not always where you would guess: conda puts a named
+    environment in `<base>/envs/<name>` when the base is writable, and in
+    `~/.conda/envs/<name>` when it is not -- which is the usual outcome against
+    a site-wide installation. The prefix is therefore returned rather than
+    assumed, by asking the environment itself once it exists.
+
+    - it already activates, and `adopt_if_exists`: adopted and returned;
+    - it already activates and is not wanted: `CondaError`;
+    - otherwise it is created.
+
+    `python` is a version for conda to solve for (`'3.12'`), not a path: conda
+    fetches an interpreter rather than building on one that is already here,
+    which is the whole reason it can offer a version the machine does not have.
+    """
+    prefix = _parse_env_prefix(run(_env_state_query(base, name, setup=setup)))
+
+    if prefix:
+        if not adopt_if_exists:
+            raise CondaError(
+                f"conda environment '{name}' already exists at {prefix}; pass "
+                f'adopt_if_exists=True to use it, or choose another name'
+            )
+        return prefix
+
+    run(_create_env_command(base, name, python=python, packages=packages, setup=setup))
+
+    prefix = _parse_env_prefix(run(_env_state_query(base, name, setup=setup)))
+    if not prefix:
+        raise CondaError(
+            f"conda reported success but environment '{name}' does not "
+            f'activate under {base}'
+        )
+    return prefix
+
+
+def _hook(base: str) -> str:
+    """Sourcing conda's shell hook, which `conda activate` does not exist without."""
+    return f'. {remote_path(base)}/etc/profile.d/conda.sh'
+
+
+def _env_state_query(base: str, name: str, *, setup: str = '') -> str:
+    """Command printing an environment's prefix, or nothing if it does not work.
+
+    Activation is the test, as it is everywhere else here: a directory under
+    `envs/` can exist and be half-written, and what the caller needs to know is
+    whether the environment can be entered.
+    """
+    activate = f'conda activate {shlex.quote(name)}'
+    return '\n'.join(filter(None, (
+        setup,
+        f'if {_hook(base)} >/dev/null 2>&1 && {activate} >/dev/null 2>&1; then',
+        '    printf \'%s\\n\' "$CONDA_PREFIX"',
+        'fi',
+    )))
+
+
+def _parse_env_prefix(stdout: str) -> str:
+    """The prefix an environment reported, or `''` if it never got that far."""
+    for line in stdout.splitlines():
+        candidate = line.strip()
+        if candidate.startswith('/'):
+            return candidate
+    return ''
+
+
+def _create_env_command(
+    base: str,
+    name: str,
+    *,
+    python: str | None = None,
+    packages: Iterable[str] = (),
+    setup: str = '',
+) -> str:
+    """Command creating the environment.
+
+    `-y` because there is no one at the prompt, and `conda create` asks before
+    it does anything. Specifications are quoted: `numpy>=1.20` is a redirection
+    to a shell that has not been told otherwise.
+    """
+    wanted = [f'python={python}'] if python else []
+    wanted += [p for p in packages if p]
+
+    create = (
+        f'conda create -y -n {shlex.quote(name)} '
+        + ' '.join(shlex.quote(spec) for spec in wanted)
+    ).rstrip()
+
+    return '\n'.join(filter(None, (
+        setup,
+        run_or_abort(_hook(base), f'could not source the conda hook at {base}'),
+        run_or_abort(create, f"could not create conda environment '{name}'"),
+    )))

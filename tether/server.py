@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import posixpath
 import shlex
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -409,6 +409,36 @@ class Server:
         """
         command = _environment.install_command(self.environment, packages)
         self.run(command, environment=True, check=True)
+
+    def create_conda_env(
+        self,
+        name: str,
+        *,
+        base: str | None = None,
+        python: str | None = None,
+        packages: Iterable[str] = (),
+        adopt_if_exists: bool = True,
+    ) -> str:
+        """Create a conda environment and report the prefix it landed in.
+
+        `base` defaults to the conda tether installs, `<workdir>/conda`, so the
+        common path needs no argument. Point it elsewhere to build against an
+        installation `probe_conda()` found.
+
+        The prefix is worth reading rather than assuming: conda relocates a
+        named environment to `~/.conda/envs` when the base is not writable,
+        which is the usual outcome against a site-wide install.
+        """
+        return _conda.create_env(
+            lambda command: self.run(command, check=True).stdout,
+            name,
+            base or self.path('conda'),
+            python=python,
+            packages=packages,
+            setup=_environment.pre_activation(self.environment),
+            adopt_if_exists=adopt_if_exists,
+        )
+
 
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.

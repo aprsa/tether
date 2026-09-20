@@ -464,3 +464,128 @@ def test_an_install_that_leaves_nothing_behind_is_an_error():
     remote = Installer(listing='')
     with pytest.raises(tether.CondaError, match='nothing that looks like'):
         conda.install(remote, '/opt/conda', installer='/tmp/mine.sh')
+
+
+# -- creating conda environments ------------------------------------------
+#
+# Where a named environment lands is not where you would guess: conda puts it
+# under the base when the base is writable and in `~/.conda/envs` when it is
+# not. These pin that the answer is asked for rather than assembled.
+
+
+class EnvRemote:
+    """A transport that answers the before-and-after state of an environment."""
+
+    def __init__(self, before='', after=''):
+        self.before, self.after = before, after
+        self.commands = []
+        self.created = False
+
+    def __call__(self, command):
+        self.commands.append(command)
+        if 'conda create' in command:
+            self.created = True
+            return ''
+        return self.after if self.created else self.before
+
+    @property
+    def trips(self):
+        return len(self.commands)
+
+
+def test_an_environment_is_created_and_its_prefix_reported():
+    remote = EnvRemote(after='/opt/conda/envs/demo\n')
+    assert conda.create_env(remote, 'demo', '/opt/conda') == '/opt/conda/envs/demo'
+    assert remote.created
+
+
+def test_the_prefix_is_asked_for_not_assembled():
+    """A named environment created against a base that is not writable lands
+    in the per-user fallback instead -- the usual outcome on a site install."""
+    remote = EnvRemote(after='/home/u/.conda/envs/demo\n')
+    got = conda.create_env(remote, 'demo', '/opt/conda')
+    assert got == '/home/u/.conda/envs/demo'
+    assert not got.startswith('/opt/conda')
+
+
+def test_an_existing_environment_is_adopted_without_creating():
+    remote = EnvRemote(before='/opt/conda/envs/demo\n')
+    assert conda.create_env(remote, 'demo', '/opt/conda') == '/opt/conda/envs/demo'
+    assert not remote.created
+    assert remote.trips == 1
+
+
+def test_adoption_can_be_refused():
+    remote = EnvRemote(before='/opt/conda/envs/demo\n')
+    with pytest.raises(tether.CondaError, match='already exists'):
+        conda.create_env(remote, 'demo', '/opt/conda', adopt_if_exists=False)
+    assert not remote.created
+
+
+def test_a_creation_that_does_not_activate_afterwards_is_an_error():
+    """conda can report success and leave something that will not enter."""
+    remote = EnvRemote(after='')
+    with pytest.raises(tether.CondaError, match='does not activate'):
+        conda.create_env(remote, 'demo', '/opt/conda')
+
+
+# -- the commands that get sent -------------------------------------------
+
+
+def test_the_hook_is_sourced_before_conda_is_used():
+    """`conda create` is a shell function; without the hook it does not exist."""
+    got = conda._create_env_command('/opt/conda', 'demo')
+    assert got.index('etc/profile.d/conda.sh') < got.index('conda create')
+
+
+def test_creation_does_not_wait_for_a_prompt():
+    """There is nobody at the other end to answer it."""
+    assert 'conda create -y' in conda._create_env_command('/opt/conda', 'demo')
+
+
+def test_a_python_version_is_solved_for_not_pointed_at():
+    """conda fetches an interpreter; that is the whole reason to ask it."""
+    got = conda._create_env_command('/opt/conda', 'demo', python='3.12')
+    assert 'python=3.12' in got
+
+
+def test_no_version_asked_for_leaves_conda_to_choose():
+    assert 'python=' not in conda._create_env_command('/opt/conda', 'demo')
+
+
+def test_package_specifiers_are_quoted():
+    """Unquoted, `numpy>=1.20` is a redirection."""
+    got = conda._create_env_command('/opt/conda', 'demo', packages=['numpy>=1.20'])
+    assert shlex.quote('numpy>=1.20') in got
+
+
+def test_failures_abort_rather_than_carrying_on():
+    """The message names the environment, and survives being quoted into an
+    `echo` -- which is why this asserts the quoted form rather than the plain
+    one."""
+    got = conda._create_env_command('/opt/conda', 'demo')
+    assert 'could not source the conda hook' in got
+    assert shlex.quote("tether: could not create conda environment 'demo'") in got
+
+
+def test_setup_runs_before_any_of_it():
+    """The conda being used may only be on PATH once a module is loaded."""
+    got = conda._create_env_command('/opt/conda', 'demo', setup='module load anaconda')
+    assert got.startswith('module load anaconda\n')
+
+
+def test_the_state_query_activates_rather_than_looking():
+    """A directory under envs/ can exist and be half-written."""
+    got = conda._env_state_query('/opt/conda', 'demo')
+    assert 'conda activate demo' in got and 'CONDA_PREFIX' in got
+
+
+@pytest.mark.parametrize('answer', ['', '\n', 'EnvironmentNameNotFound: x\n'])
+def test_an_environment_that_never_activated_has_no_prefix(answer):
+    assert conda._parse_env_prefix(answer) == ''
+
+
+def test_only_an_absolute_path_counts_as_a_prefix():
+    assert conda._parse_env_prefix('warning: ignored\n/opt/conda/envs/x\n') == (
+        '/opt/conda/envs/x'
+    )
