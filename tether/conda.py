@@ -50,17 +50,6 @@ _SOURCES = (
 #: environment, both of which otherwise look alike.
 _HOOK = '/etc/profile.d/conda.sh'
 
-#: Conda records its own version in a `conda-meta` filename, so a directory
-#: listing answers the question that `conda --version` would spend a Python
-#: interpreter launch on.
-_META = re.compile(r'(?P<base>.*)/conda-meta/conda-(?P<version>[0-9][^-]*)-[^/]*\.json')
-
-#: An environment directory, under a base or under the per-user fallback. The
-#: name may not contain a separator, which is what keeps a path like
-#: `<base>/envs/<name>/conda-meta/conda-*.json` from being read as one.
-_ENV = re.compile(r'(?P<parent>.*)/envs/(?P<name>[^/]+)')
-
-
 @dataclass(frozen=True)
 class CondaInstallation:
     """A conda installation found on the remote, and what it can activate.
@@ -431,6 +420,13 @@ def _parse_listing(stdout: str) -> list[CondaInstallation]:
     of them; environments under a candidate that turned out not to be a base
     belong to nothing and are dropped, rather than credited to every base.
     """
+    # Conda records its own version in a `conda-meta` filename, so a listing
+    # answers what `conda --version` would spend an interpreter launch on. An
+    # environment name may not contain a separator, which is what keeps
+    # `<base>/envs/<name>/conda-meta/conda-*.json` from being read as one.
+    meta = re.compile(r'(?P<base>.*)/conda-meta/conda-(?P<version>[0-9][^-]*)-[^/]*\.json')
+    env = re.compile(r'(?P<parent>.*)/envs/(?P<name>[^/]+)')
+
     paths = [line.rstrip('/') for line in stdout.splitlines() if line.strip()]
 
     environments: dict[str, list[str]] = {
@@ -440,14 +436,14 @@ def _parse_listing(stdout: str) -> list[CondaInstallation]:
     fallback: list[str] = []
 
     for path in paths:
-        if meta := _META.fullmatch(path):
-            if meta['base'] in environments:
-                versions.setdefault(meta['base'], meta['version'])
-        elif env := _ENV.fullmatch(path):
-            if (known := environments.get(env['parent'])) is not None:
-                known.append(env['name'])
-            elif posixpath.basename(env['parent']) == '.conda':
-                fallback.append(env['name'])
+        if found := meta.fullmatch(path):
+            if found['base'] in environments:
+                versions.setdefault(found['base'], found['version'])
+        elif found := env.fullmatch(path):
+            if (known := environments.get(found['parent'])) is not None:
+                known.append(found['name'])
+            elif posixpath.basename(found['parent']) == '.conda':
+                fallback.append(found['name'])
 
     return [
         CondaInstallation(base=base,

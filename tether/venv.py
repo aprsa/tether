@@ -27,14 +27,8 @@ from dataclasses import dataclass
 from .errors import VenvError
 from .shell import printf, remote_path, run_or_abort
 
-#: Names an interpreter is plausibly reachable by: `python`, `python3`,
-#: `python3.12`, and the free-threaded `python3.13t`. Deliberately not
-#: `python3-config`, `python-dotenv` or anything else a package drops into the
-#: same directory -- those would be *executed* by the identity probe otherwise.
 #: What a version is when nothing would say.
 UNKNOWN = 'unknown'
-
-_INTERPRETER = re.compile(r'/python[0-9]*(?:\.[0-9]+)?t?\Z')
 
 #: What each candidate is asked about itself. `sys.executable` because the
 #: interpreter knows where it lives, `sys.version` because a filename can lie
@@ -115,6 +109,10 @@ def _parse_candidates(stdout: str) -> tuple[str, ...]:
     because the next step *runs* what survives, and running `python-dotenv` to
     see what it says is not a thing to do casually.
     """
+    # Names an interpreter is plausibly reachable by: `python`, `python3`,
+    # `python3.12`, and the free-threaded `python3.13t`. Deliberately not
+    # `python3-config` or `python-dotenv`, which the next step would *execute*.
+    interpreter = re.compile(r'/python[0-9]*(?:\.[0-9]+)?t?\Z')
     seen: dict[str, None] = {}
 
     for line in stdout.splitlines():
@@ -122,7 +120,7 @@ def _parse_candidates(stdout: str) -> tuple[str, ...]:
         if len(parts) != 2:
             continue
         typed, resolved = parts
-        if resolved and _INTERPRETER.search(typed):
+        if resolved and interpreter.search(typed):
             seen.setdefault(resolved, None)
 
     return tuple(seen)

@@ -229,20 +229,42 @@ Everything about one job lives in one directory — the script as submitted,
 before submission (the jobid does not exist until `sbatch` has already been told
 where to run), and it is what lets a later session pick the job up again.
 
-A second job of the same name in the same second gets an index —
-`fit.20260919-184816.2` — rather than taking the first one's directory over.
-The loop that finds the free name runs in the shell, because `mkdir` either
-creates or fails atomically; asking first and creating second would leave a
-window another submitter could step into.
-
 `Submission` is a record of the *request*, not of the job's state, so it does not
-go stale. Ask `job()` or `queue()` for what the job is doing now.
+go stale.
 
 **Slurm is the source of truth for state**, and the filesystem for artifacts.
-There is no exit-code sentinel: `sacct` records state and exit code durably
-wherever accounting is configured, and a second record would be a second truth.
-Where it is not configured, `scontrol` still answers for `MinJobAge` (300s by
-default) and the job directory still proves the job existed.
+There is no exit-code sentinel: Slurm already records state and exit code, and
+a second record would be a second truth.
+
+`job()` asks two sources, depending on job status/availability:
+
+| | `scontrol` | `sacct` |
+| --- | --- | --- |
+| pending or running, at any age | yes | yes |
+| finished | for `MinJobAge` (300s) | durably |
+| why a job is pending | yes | field exists, never filled |
+| exit code | yes | yes |
+| needs `slurmdbd` | no | **yes** |
+
+Thus, `scontrol` answers everything during a poll loop, and the accounting
+database is consulted only for a job that has both finished *and* aged out --
+the ordinary case for a detached job someone comes back to hours later.
+
+```python
+job = srv.job(sub.jobid)
+job.state        # 'FAILED'
+job.exit_code    # 7
+job.is_failed    # True
+```
+
+Read `state`, not `exit_code`, to decide whether a job succeeded: a *cancelled*
+job reports exit code 0 on its allocation row, because only the `.batch` step
+records the signal that killed it. And `signal` is kept separate from
+`exit_code` for the same reason — a signalled job exits 0.
+
+On a cluster with no accounting, a job that finished more than `MinJobAge` ago
+is lost from Slurm. The job directory still proves it ran, and
+its `stdout` is still there.
 
 ## Decisions worth knowing
 
@@ -330,8 +352,6 @@ which is caught internally.
 
 Environments are done; running things is not. Deliberately deferred:
 
-- `job()` falling back to `sacct`, so a finished job stops looking like a
-  missing one
 - file staging into the job directory, and fetching results back out
 - `cancel()`, log streaming, reattach-by-directory
 

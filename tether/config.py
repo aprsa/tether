@@ -51,7 +51,6 @@ VERSION_KEY = 'tether'
 
 #: A server name becomes a filename, so it must not contain separators or
 #: traverse. Leading character is alphanumeric, which also rules out `.`/`..`.
-_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 
 
 class ServerKind(StrEnum):
@@ -69,7 +68,7 @@ def servers_dir(config_dir: str | Path | None = None) -> Path:
 
 def server_path(name: str, config_dir: str | Path | None = None) -> Path:
     """Where `name` is stored. Validates the name, since it is a filename."""
-    if not _NAME.match(name):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name):
         raise ConfigError(
             f'not a usable server name: {name!r} -- it becomes a filename, so '
             f'it must start with a letter or digit and contain only letters, '

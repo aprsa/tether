@@ -2,21 +2,29 @@
 
 import json
 import pathlib
+import shlex
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 import tether
 from tether.slurm import (
+    SACCT_SPEC,
     batch_script,
     check_name,
     claim_command,
+    distill_state,
     job_directory,
     parse_claim,
     parse_duration,
+    parse_exit_code,
+    parse_sacct,
+    parse_scontrol,
     parse_sinfo,
     parse_squeue,
     parse_submit,
+    sacct_command,
+    scontrol_command,
     submit_command,
 )
 
@@ -504,3 +512,144 @@ def test_the_claimed_directory_is_the_one_reported():
 def test_claiming_nothing_is_an_error_not_a_silent_reuse(noise):
     with pytest.raises(tether.SlurmError, match='could not create a job directory'):
         parse_claim(noise)
+
+
+# -- asking Slurm what happened -------------------------------------------
+#
+# Two sources with different strengths: `scontrol` reads slurmctld and carries
+# the pending reason, `sacct` reads the accounting database and is the only
+# one that still knows about a job that finished long ago. A `Job` looks the
+# same either way, which is what lets a caller not care.
+
+SCONTROL_LINE = (
+    'JobId=682 JobName=fit UserId=andrej(1000) GroupId=users Priority=1 '
+    'JobState=FAILED Reason=NonZeroExitCode Dependency=(null) ExitCode=7:0 '
+    'RunTime=00:01:05 TimeLimit=01:00:00 Partition=intel NumNodes=2 '
+    'NumCPUs=8 WorkDir=/home/andrej/jobs/fit.1'
+)
+
+
+def test_a_job_read_from_slurmctld():
+    job = parse_scontrol(SCONTROL_LINE)
+    assert (job.jobid, job.name, job.state) == ('682', 'fit', 'FAILED')
+    assert (job.exit_code, job.signal) == (7, 0)
+    assert (job.nodes, job.cpus) == (2, 8)
+    assert job.reason == 'NonZeroExitCode'
+    assert job.elapsed == timedelta(minutes=1, seconds=5)
+    assert job.is_finished and job.is_failed
+
+
+def test_the_uid_slurm_appends_to_a_username_is_dropped():
+    """`UserId=andrej(1000)` -- the number is not part of the name."""
+    assert parse_scontrol(SCONTROL_LINE).user == 'andrej'
+
+
+@pytest.mark.parametrize('answer', [
+    '', '\n', 'slurm_load_jobs error: Invalid job id specified\n',
+])
+def test_a_job_slurmctld_never_heard_of(answer):
+    assert parse_scontrol(answer) is None
+
+
+def test_a_value_with_a_space_does_not_swallow_the_next_field():
+    """Slurm does not escape values, so this is read key by key rather than by
+    splitting the line. Every key tether reads has a single-token value."""
+    line = SCONTROL_LINE + ' Comment=some words here Account=phoebe'
+    job = parse_scontrol(line)
+    assert job.state == 'FAILED' and job.exit_code == 7
+
+
+# -- the accounting database ----------------------------------------------
+
+
+def sacct_row(**over):
+    fields = {
+        'jobid': '682', 'state': 'COMPLETED', 'partition': 'intel',
+        'user': 'andrej', 'nodes': '2', 'cpus': '8', 'elapsed': '00:01:05',
+        'timelimit': '01:00:00', 'workdir': '/home/andrej', 'exit': '0:0',
+        'name': 'fit',
+    }
+    fields.update(over)
+    return '|'.join(fields[k] for k in SACCT_SPEC) + '\n'
+
+
+def test_a_job_read_from_accounting():
+    job = parse_sacct(sacct_row())[0]
+    assert (job.jobid, job.name, job.state) == ('682', 'fit', 'COMPLETED')
+    assert (job.exit_code, job.signal) == (0, 0)
+    assert job.is_finished and not job.is_failed
+
+
+def test_accounting_has_no_reason_to_give():
+    """sacct offers the field and never fills it, so asking would produce a
+    convincing blank. A pending job's reason comes from scontrol."""
+    assert parse_sacct(sacct_row())[0].reason == ''
+
+
+def test_a_cancelled_job_is_finished_despite_how_slurm_spells_it():
+    """sacct writes `CANCELLED by 1000` -- the uid of whoever asked. Left whole
+    it matches nothing in FINISHED_STATES, so the job would read as neither
+    running nor finished."""
+    job = parse_sacct(sacct_row(state='CANCELLED by 1000'))[0]
+    assert job.state == 'CANCELLED'
+    assert job.is_finished and job.is_failed
+
+
+def test_a_cancelled_job_exits_zero_and_is_still_a_failure():
+    """The allocation row reports 0:0 for a killed job -- only the .batch step
+    records the signal. `state` is the authority, not `exit_code`."""
+    job = parse_sacct(sacct_row(state='CANCELLED by 1000', exit='0:0'))[0]
+    assert job.exit_code == 0
+    assert job.is_failed
+
+
+def test_a_pipe_in_the_job_name_is_absorbed():
+    """Which is why `name` is requested last."""
+    assert parse_sacct(sacct_row(name='a|b'))[0].name == 'a|b'
+
+
+def test_unparseable_accounting_lines_are_skipped():
+    assert parse_sacct('\nnonsense\n682|COMPLETED\n') == []
+
+
+# -- the pieces both share ------------------------------------------------
+
+
+@pytest.mark.parametrize(('raw', 'want'), [
+    ('CANCELLED by 1000', 'CANCELLED'), ('completed', 'COMPLETED'),
+    ('  RUNNING  ', 'RUNNING'), ('', ''),
+])
+def test_state_normalisation(raw, want):
+    assert distill_state(raw) == want
+
+
+@pytest.mark.parametrize(('raw', 'want'), [
+    ('7:0', (7, 0)),        # exited 7
+    ('0:9', (0, 9)),        # killed by SIGKILL, and so exited 0
+    ('0:0', (0, 0)),
+    ('', (None, None)),
+    ('N/A', (None, None)),
+])
+def test_exit_codes_keep_the_signal_separate(raw, want):
+    """A signalled job exits 0, so collapsing the two would make `scancel`
+    indistinguishable from success."""
+    assert parse_exit_code(raw) == want
+
+
+def test_a_job_from_squeue_has_no_exit_code():
+    """squeue does not carry one; None means "not known", not "exited zero"."""
+    line = '682|RUNNING|intel|andrej|2|8|00:01:05|01:00:00|None|/home/andrej|fit'
+    job = parse_squeue(line)[0]
+    assert job.exit_code is None and job.signal is None
+
+
+def test_the_commands_quote_the_job_id():
+    assert shlex.split(scontrol_command('1; rm -rf /'))[-2] == '1; rm -rf /'
+    assert shlex.split(sacct_command('1; rm -rf /'))[-1] == '1; rm -rf /'
+
+
+def test_accounting_is_asked_for_the_job_not_its_steps():
+    """Without -X every job comes back as three rows: the allocation, .batch
+    and .extern."""
+    assert ' -X ' in sacct_command('682')
+    assert '--parsable2' in sacct_command('682')

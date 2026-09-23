@@ -10,12 +10,6 @@ from __future__ import annotations
 import re
 import shlex
 
-#: Characters that keep their special meaning inside double quotes.
-_IN_DQUOTES = re.compile(r'([\\"$`])')
-
-#: A shell variable name. Anything else could smuggle code into an `export`.
-_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
-
 
 def remote_path(path: str) -> str:
     """Convert path string into a shell command, expanding `~` and quoting if
@@ -27,7 +21,9 @@ def remote_path(path: str) -> str:
     if path == '~':
         return '"$HOME"'
     if path.startswith('~/'):
-        return f'"$HOME/{_IN_DQUOTES.sub(r"\\\1", path[2:])}"'
+        # The four characters that keep their meaning inside double quotes.
+        escaped = re.sub(r'([\\"$`])', r'\\\1', path[2:])
+        return f'"$HOME/{escaped}"'
     return shlex.quote(path)
 
 
@@ -50,5 +46,8 @@ def printf(*words: str) -> str:
 
 
 def is_identifier(name: str) -> bool:
-    """Whether `name` is safe to use as a shell variable name."""
-    return _IDENTIFIER.match(name) is not None
+    """Whether `name` is safe to use as a shell variable name.
+
+    Anything else could smuggle code into an `export`.
+    """
+    return re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) is not None

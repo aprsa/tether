@@ -65,13 +65,19 @@ def submit(srv, script, name='probe', sbatch_args=''):
 
 
 def wait_for(srv, jobid, timeout=90):
-    """Block until squeue no longer lists the job."""
+    """Block until the job reports a finished state.
+
+    Not "until `job()` returns None": since `job()` consults `scontrol` and
+    then `sacct`, a finished job keeps answering -- with its state and exit
+    code -- rather than vanishing. Waiting for silence would wait forever.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if srv.job(jobid) is None:
-            return
+        found = srv.job(jobid)
+        if found is None or found.is_finished:
+            return found
         time.sleep(0.3)
-    raise AssertionError(f'job {jobid} still queued after {timeout}s')
+    raise AssertionError(f'job {jobid} still running after {timeout}s')
 
 
 def outcome(srv, jobid):
@@ -382,15 +388,18 @@ def test_queue_filters_by_user(srv):
         wait_for(srv, jobid)
 
 
-def test_job_lookup_and_disappearance(srv):
-    """`job()` returning None conflates "finished" with "never existed"."""
+def test_a_finished_job_still_answers_and_a_fictional_one_does_not(srv):
+    """The two used to be indistinguishable -- both came back None. `scontrol`
+    still holds a finished job for MinJobAge, and `sacct` after that, so only
+    a job Slurm genuinely never saw is empty now."""
     jobid = submit(srv, '#!/bin/bash\nsleep 2\n', name='lookup')
     found = srv.job(jobid)
     assert found is not None and found.jobid == jobid
 
-    wait_for(srv, jobid)
-    assert srv.job(jobid) is None          # finished
-    assert srv.job('999999') is None       # never existed -- indistinguishable
+    done = wait_for(srv, jobid)
+    assert done is not None and done.is_finished and not done.is_failed
+    assert done.exit_code == 0
+    assert srv.job('999999') is None
 
 
 def test_real_exit_code_survives(srv):
@@ -439,28 +448,23 @@ def sacct(srv, jobid, fields='JobID,State,ExitCode'):
     return out.split('|') if out else []
 
 
-def test_sacct_remembers_a_job_squeue_has_forgotten(srv):
-    """The squeue -> sacct handoff, which is why `job()` cannot rely on squeue.
-
-    squeue only knows pending and running jobs; the moment one finishes it is
-    gone from the queue, and only accounting can still say what happened.
-    """
+def test_a_failure_reaches_the_caller_with_its_exit_code(srv):
+    """squeue could never have answered this: it drops a job the moment it
+    finishes, and carries no exit code even while it has one."""
     jobid = submit(srv, '#!/bin/bash\nexit 5\n', name='acct')
-    wait_for(srv, jobid)
+    done = wait_for(srv, jobid)
 
-    assert srv.job(jobid) is None                    # squeue: never heard of it
-    assert sacct(srv, jobid) == [jobid, 'FAILED', '5:0']
+    assert done.state == 'FAILED' and done.is_failed
+    assert (done.exit_code, done.signal) == (5, 0)
+    assert sacct(srv, jobid) == [jobid, 'FAILED', '5:0']   # independent check
 
 
-def test_sacct_covers_the_case_the_sentinel_cannot(srv):
-    """A cancelled job's shell is killed, so nothing it would write on exit
-    happens -- no exit-code sentinel is ever created. Accounting is the only
-    remaining source, which is precisely why completion needs two of them.
+def test_a_cancelled_job_is_failed_even_though_its_exit_code_is_zero(srv):
+    """The trap `-X` leaves behind, pinned so nobody "fixes" it later.
 
-    Note where the evidence lives, because it is a trap for completion
-    detection: the *allocation* row reports `ExitCode 0:0` even though the job
-    was killed. Only the `.batch` step records the signal. Reading ExitCode off
-    the allocation row alone would call this job a success.
+    The allocation row reports `ExitCode 0:0` for a killed job -- only the
+    `.batch` step records the signal. A caller reading `exit_code == 0` as
+    success would be wrong; `state` and `is_failed` are the authority.
     """
     jobid = submit(srv, '#!/bin/bash\nsleep 60\n', name='killed')
     for _ in range(60):

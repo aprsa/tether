@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -133,6 +134,8 @@ class Job:
     timelimit: timedelta | None
     reason: str
     workdir: str
+    exit_code: int | None = None
+    signal: int | None = None
 
     @property
     def is_pending(self) -> bool:
@@ -272,11 +275,6 @@ _DIRECTIVES = {
     'memory': 'mem',
 }
 
-#: A job name that is safe as both a directory component and an `#SBATCH`
-#: value. Slurm accepts more than this, but a name becomes a path here.
-_NAME = re.compile(r'[A-Za-z0-9._-]+\Z')
-
-
 @dataclass(frozen=True)
 class Submission:
     """A complete account of what was sent to the cluster.
@@ -327,7 +325,8 @@ def check_name(name: str) -> None:
     """A job name is also a directory component, so it is narrower than Slurm
     would allow. Raises `SlurmError` rather than producing a path with a `/`
     in the middle of it."""
-    if not _NAME.match(name or ''):
+    # Slurm accepts more than this, but a name becomes a directory here.
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', name or ''):
         raise SlurmError(
             f'{name!r} is not a usable job name: it becomes a directory, so '
             f'letters, digits, dot, dash and underscore only'
@@ -459,3 +458,160 @@ def parse_claim(stdout: str) -> str:
             'or the parent is not writable'
         )
     return made[0].strip()
+
+
+#: `scontrol show job` keys, mapped onto `Job` fields. It reads slurmctld's
+#: memory rather than the accounting database, so it answers for any pending
+#: or running job regardless of age, and for a finished one until `MinJobAge`
+#: (300s by default) purges it. Unlike `squeue` it carries the exit code, and
+#: unlike `sacct` it needs no accounting service.
+SCONTROL_KEYS = {
+    'jobid': 'JobId',
+    'name': 'JobName',
+    'state': 'JobState',
+    'partition': 'Partition',
+    'user': 'UserId',
+    'nodes': 'NumNodes',
+    'cpus': 'NumCPUs',
+    'elapsed': 'RunTime',
+    'timelimit': 'TimeLimit',
+    'reason': 'Reason',
+    'workdir': 'WorkDir',
+    'exit': 'ExitCode',
+}
+
+#: `sacct` fields, in the order they are requested. The durable record: the
+#: only source that still knows about a job that finished long ago, which is
+#: the ordinary case for a detached job someone comes back to.
+SACCT_SPEC = {
+    'jobid': 'JobID',
+    'state': 'State',
+    'partition': 'Partition',
+    'user': 'User',
+    'nodes': 'NNodes',
+    'cpus': 'NCPUS',
+    'elapsed': 'Elapsed',
+    'timelimit': 'Timelimit',
+    'workdir': 'WorkDir',
+    'exit': 'ExitCode',
+    'name': 'JobName',
+}
+
+
+#: One `Key=Value` out of a `--oneliner` dump. Targeted rather than splitting
+#: the whole line, because Slurm does not escape values containing spaces: a
+#: `WorkDir=/a b` would swallow the next field. Every key read here has a
+#: single-token value, and tether validates its own job names.
+def _scontrol_value(line: str, key: str) -> str:
+    found = re.search(rf'(?:^|\s){re.escape(key)}=(\S*)', line)
+    return found.group(1) if found else ''
+
+
+def scontrol_command(jobid: str | int) -> str:
+    """Command asking slurmctld about one job."""
+    return f'scontrol show job {shlex.quote(str(jobid))} --oneliner'
+
+
+def sacct_command(jobid: str | int) -> str:
+    """Command asking the accounting database about a job.
+
+    `-X` keeps it to the job rather than also listing every step, and
+    `--parsable2` gives `|`-separated fields with no trailing separator.
+
+    The cost of `-X` is worth stating: a cancelled job's allocation row reports
+    `ExitCode 0:0`, because only the `.batch` step records the signal that
+    killed it. The *state* still says `CANCELLED`, so nothing is lost for a
+    caller who reads `is_failed` -- but one who reads `exit_code == 0` as
+    success would be wrong.
+    """
+    fields = ','.join(SACCT_SPEC.values())
+    return f'sacct -n -X --parsable2 -o {fields} -j {shlex.quote(str(jobid))}'
+
+
+def parse_scontrol(stdout: str) -> Job | None:
+    """`Job` from `scontrol show job --oneliner`, or `None`.
+
+    `None` covers both "no such job" and an error line, since slurmctld
+    answers an unknown id with `slurm_load_jobs error` on stderr and nothing
+    usable on stdout.
+    """
+    line = stdout.strip()
+    if not line or not _scontrol_value(line, 'JobId'):
+        return None
+
+    f = {name: _scontrol_value(line, key) for name, key in SCONTROL_KEYS.items()}
+    exit_code, signal = parse_exit_code(f['exit'])
+
+    return Job(
+        jobid=f['jobid'],
+        name=f['name'],
+        state=distill_state(f['state']),
+        partition=f['partition'],
+        user=f['user'].partition('(')[0],   # UserId=root(0)
+        nodes=_int(f['nodes']),
+        cpus=_int(f['cpus']),
+        elapsed=parse_duration(f['elapsed']),
+        timelimit=parse_duration(f['timelimit']),
+        reason=f['reason'],
+        workdir=f['workdir'],
+        exit_code=exit_code,
+        signal=signal,
+    )
+
+
+def parse_sacct(stdout: str) -> list[Job]:
+    """Jobs from `sacct --parsable2`. Unparseable lines are skipped.
+
+    `reason` comes back empty: sacct offers the field but never fills it, so
+    asking would only produce a convincing blank. A pending job's reason has
+    to come from `scontrol`, which still has it at any age.
+    """
+    jobs = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = _fields(line, len(SACCT_SPEC))
+        if parts is None:
+            continue
+        f = dict(zip(SACCT_SPEC.keys(), (p.strip() for p in parts)))
+        exit_code, signal = parse_exit_code(f['exit'])
+
+        jobs.append(
+            Job(
+                jobid=f['jobid'],
+                name=f['name'],
+                state=distill_state(f['state']),
+                partition=f['partition'],
+                user=f['user'],
+                nodes=_int(f['nodes']),
+                cpus=_int(f['cpus']),
+                elapsed=parse_duration(f['elapsed']),
+                timelimit=parse_duration(f['timelimit']),
+                reason='',
+                workdir=f['workdir'],
+                exit_code=exit_code,
+                signal=signal,
+            )
+        )
+    return jobs
+
+
+def distill_state(raw: str) -> str:
+    """The state as a bare token.
+
+    sacct reports a cancelled job as `CANCELLED by 1000` -- the uid of whoever
+    asked. Left whole it matches nothing in `FINISHED_STATES`, so a cancelled
+    job would read as neither finished nor running.
+    """
+    return raw.strip().upper().split(' ', 1)[0]
+
+
+def parse_exit_code(raw: str) -> tuple[int | None, int | None]:
+    """`ExitCode=3:0` as `(exit status, signal)`.
+
+    Both halves are kept: a job killed by a signal exits 0 with a non-zero
+    signal, so collapsing them would make it indistinguishable from success.
+    `(None, None)` when Slurm said nothing useful.
+    """
+    status, _, killed = raw.strip().partition(':')
+    return _int(status), _int(killed)

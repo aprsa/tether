@@ -439,7 +439,6 @@ class Server:
             adopt_if_exists=adopt_if_exists,
         )
 
-
     def verify_environment(self) -> EnvironmentInfo:
         """Activate the environment and report what came back.
 
@@ -592,26 +591,48 @@ class SlurmServer(Server):
         return _slurm.parse_squeue(self.run(command, check=True).stdout)
 
     def job(self, jobid: str | int) -> Job | None:
-        """One job by id, or `None` if the queue has never heard of it.
+        """One job by id, at any point in its life, or `None` if no record of
+        it survives anywhere.
 
-        `None` is ambiguous today: it means "not pending and not running", which
-        covers both "finished" and "never existed". Disambiguating that is the
-        job of `sacct` plus an exit-code sentinel in the job directory, and is
-        deliberately deferred.
+        Two sources, depending on job status/timeline:
+
+        - `scontrol`, which reads slurmctld's memory. It knows every pending
+          and running job regardless of age, and every finished one until
+          `MinJobAge` (300s by default) purges it. It carries the exit code,
+          which `squeue` does not, and the pending `reason`, which `sacct`
+          does not. No accounting service is required.
+        - `sacct`, the accounting database, which is the only thing that still
+          knows about a job that finished long ago -- the ordinary case for a
+          detached job someone comes back to hours later. It needs `slurmdbd`;
+          on a cluster without it, an old job is simply unknowable from Slurm,
+          and the job directory is what proves it ran.
+
+        Thus, the second call happens only for a job that has both finished *and*
+        aged out, never during a poll loop.
+
+        A job that finished is reported with
+        its state and exit code; only one that Slurm has genuinely never heard
+        of -- or has forgotten entirely -- comes back empty (`None`).
         """
         self.connect()
-        fmt = shlex.quote(_slurm.spec_format(_slurm.SQUEUE_SPEC))
-        command = f'squeue -h -a -o {fmt} --job={shlex.quote(str(jobid))}'
-        result = self.run(command)
 
-        if not result.ok:
-            if 'invalid job id' in result.stderr.lower():
-                return None
+        live = self.run(_slurm.scontrol_command(jobid))
+        if live.ok:
+            found = _slurm.parse_scontrol(live.stdout)
+            if found is not None:
+                return found
+        elif 'invalid job id' not in live.stderr.lower():
             raise SlurmError(
-                f'squeue failed for job {jobid}: {result.stderr.strip()}'
+                f'scontrol failed for job {jobid}: {live.stderr.strip()}'
             )
 
-        jobs = _slurm.parse_squeue(result.stdout)
+        # Finished and purged from slurmctld, or never existed. Only the
+        # accounting database can still tell the two apart.
+        past = self.run(_slurm.sacct_command(jobid))
+        if not past.ok:
+            return None
+
+        jobs = _slurm.parse_sacct(past.stdout)
         return jobs[0] if jobs else None
 
     def submit(
