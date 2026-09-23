@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import posixpath
 import shlex
 from collections.abc import Iterable, Mapping
@@ -635,6 +636,39 @@ class SlurmServer(Server):
         jobs = _slurm.parse_sacct(past.stdout)
         return jobs[0] if jobs else None
 
+    def stdout(self, job: Submission | str) -> str:
+        """What the job has written to stdout (thus far).
+
+        Readable while the job is still running, which is how partial output
+        is followed -- Slurm writes into the file as the job goes.
+
+        Takes a `Submission` or a job directory, so a job picked up in a later
+        session can be read without one. Empty means the job has not started
+        writing; a missing directory raises an error, as that implies a manual
+        removal of the job history.
+        """
+        return self._read_job_file(job, _slurm.STDOUT)
+
+    def stderr(self, job: Submission | str) -> str:
+        """What the job has written to stderr (thus far). See `stdout()`."""
+        return self._read_job_file(job, _slurm.STDERR)
+
+    def _read_job_file(self, job: Submission | str, filename: str) -> str:
+        directory = job.directory if isinstance(job, Submission) else job
+        at = _shell.remote_path(directory)
+
+        # Two different absences: no directory is a problem, no file yet is
+        # not. `cat` alone would report them identically.
+        result = self.run(
+            f'[ -d {at} ] || exit 2\ncat {at}/{filename} 2>/dev/null || true'
+        )
+        if result.returncode == 2:
+            raise SlurmError(
+                f'no job directory at {directory}: it was never created, or '
+                f'it has been removed'
+            )
+        return result.stdout
+
     def cancel(self, jobid: str | int) -> None:
         """Cancel a job. No return value; raises if there is nothing to cancel.
 
@@ -668,7 +702,6 @@ class SlurmServer(Server):
 
         self.run(_slurm.cancel_command(jobid), check=True)
 
-
     def submit(
         self,
         payload: str,
@@ -680,6 +713,7 @@ class SlurmServer(Server):
         time: str | None = None,
         memory: str | None = None,
         directives: Mapping[str, str] | None = None,
+        inputs: Iterable[str | os.PathLike[str]] = (),
         jobs_base: str | None = None,
     ) -> Submission:
         """Submit `payload` as a batch job, and report what was sent.
@@ -696,7 +730,24 @@ class SlurmServer(Server):
 
         `directives` passes anything tether has not anticipated straight
         through: `{'gres': 'gpu:1'}` becomes `#SBATCH --gres=gpu:1`.
+
+        `inputs` are local files or directories copied into the job directory
+        before submission. Because the job runs there, the payload refers to
+        them by bare name -- `python fit.py data.csv`, not a path. They are
+        checked before the directory is claimed, so a typo does not leave an
+        empty job directory behind.
+
+        Per-job inputs only. A large file shared by many jobs should be `put()`
+        somewhere stable once and referred to by absolute path, rather than
+        copied per submission.
         """
+        staged = [pathlib.Path(source) for source in inputs]
+        missing = [str(source) for source in staged if not source.exists()]
+        if missing:
+            raise ConfigError(
+                f'cannot stage {", ".join(missing)}: no such file or directory'
+            )
+
         base = jobs_base or self.path('jobs')
         # Naive local time on purpose: this is a label for a human reading
         # `ls`, never compared or converted. Uniqueness is enforced below, not
@@ -721,6 +772,12 @@ class SlurmServer(Server):
             self.run(_slurm.claim_command(directory), check=True).stdout
         )
         at = _shell.remote_path(directory)
+        for source in staged:
+            self.put(
+                source,
+                posixpath.join(directory, source.name),
+                recurse=source.is_dir(),
+            )
         self.run(
             f'printf %s {shlex.quote(script)} > {at}/{_slurm.SCRIPT}', check=True
         )
@@ -742,6 +799,7 @@ class SlurmServer(Server):
             time=time,
             memory=memory,
             directives=tuple((directives or {}).items()),
+            inputs=tuple(source.name for source in staged),
         )
 
 

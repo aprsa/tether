@@ -908,3 +908,59 @@ def test_cancelling_a_job_that_never_existed_is_an_error(srv):
     """The case a typo produces, which `scancel` reports as success."""
     with pytest.raises(tether.SlurmError, match='no record of job'):
         srv.cancel('999999')
+
+
+# -- staging inputs and reading output -------------------------------------
+
+
+def test_inputs_are_staged_and_the_payload_sees_them_by_bare_name(srv, tmp_path):
+    """The job runs in its own directory, so a staged file needs no path."""
+    (tmp_path / 'data.csv').write_text('1,2,3\n')
+    (tmp_path / 'tree').mkdir()
+    (tmp_path / 'tree' / 'extra.txt').write_text('nested\n')
+
+    s = srv.submit('cat data.csv; cat tree/extra.txt', name='staged',
+                   time='00:02:00',
+                   inputs=[tmp_path / 'data.csv', tmp_path / 'tree'])
+    try:
+        assert s.inputs == ('data.csv', 'tree')
+        wait_for(srv, s.jobid)
+        assert srv.stdout(s).split() == ['1,2,3', 'nested']
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_a_missing_input_is_caught_before_a_directory_is_claimed(srv):
+    """Otherwise a typo leaves an orphaned job directory behind."""
+    before = srv.run(f'ls -1 {srv.path("jobs")} 2>/dev/null | wc -l',
+                     check=True).stdout.strip()
+    with pytest.raises(tether.ConfigError, match='no such file or directory'):
+        srv.submit('true', name='typo', inputs=['/tmp/does-not-exist.csv'])
+    after = srv.run(f'ls -1 {srv.path("jobs")} 2>/dev/null | wc -l',
+                    check=True).stdout.strip()
+    assert before == after
+
+
+def test_output_can_be_read_by_directory_without_a_submission(srv):
+    """The detached case: a later session has the directory, not the object."""
+    s = srv.submit('echo hello', name='bydir', time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        assert srv.stdout(s.directory).strip() == 'hello'
+        assert srv.stderr(s.directory) == ''
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_a_job_that_has_not_written_yet_reads_empty(srv):
+    """Empty output and a missing job directory are different answers."""
+    s = srv.submit('sleep 30', name='quiet', time='00:02:00')
+    try:
+        assert srv.stdout(s) == ''
+    finally:
+        srv.run(f'scancel {s.jobid} 2>/dev/null; rm -rf {s.directory}', check=False)
+
+
+def test_a_removed_job_directory_is_an_error_not_an_empty_string(srv):
+    with pytest.raises(tether.SlurmError, match='no job directory'):
+        srv.stdout('/tmp/tether-no-such-job')

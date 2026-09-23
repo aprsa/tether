@@ -275,6 +275,7 @@ _DIRECTIVES = {
     'memory': 'mem',
 }
 
+
 @dataclass(frozen=True)
 class Submission:
     """A complete account of what was sent to the cluster.
@@ -298,6 +299,7 @@ class Submission:
     time: str | None = None
     memory: str | None = None
     directives: tuple[tuple[str, str], ...] = ()
+    inputs: tuple[str, ...] = ()
 
     def __str__(self) -> str:
         asked = ', '.join(
@@ -364,6 +366,17 @@ def batch_script(
     is what proves the job ran. A second record would be a second truth.
     """
     check_name(name)
+
+    # check for protected directives:
+    asked_for = directives or {}
+    reserved = [name for name in ('output', 'error') if name in asked_for]
+    if reserved:
+        raise SlurmError(
+            f'{", ".join(sorted(reserved))} cannot be set through directives: '
+            f"tether writes the job's output into its own directory, and "
+            f'`stdout()` reads it from there. Redirect inside the payload if '
+            f'you need it elsewhere'
+        )
 
     lines = ['#!/bin/bash']
     asked = {'name': name, 'partition': partition, 'nodes': nodes,
@@ -615,6 +628,7 @@ def parse_exit_code(raw: str) -> tuple[int | None, int | None]:
     """
     status, _, killed = raw.strip().partition(':')
     return _int(status), _int(killed)
+
 
 def cancel_command(jobid: str | int) -> str:
     """Command asking Slurm to cancel one job.

@@ -270,6 +270,25 @@ its `stdout` is still there.
 
 It is also deliberately not synchronous. `scancel` returns immediately while the job moves through `COMPLETING` at its own pace. Ask `job()` to get the up-to-date status.
 
+### Getting files in and out
+
+`inputs` copies local files or directories into the job directory before submission. The job runs there, so the payload names them bare:
+
+```python
+s = srv.submit('python fit.py data.csv', name='fit',
+               inputs=['fit.py', 'data.csv'])
+s.inputs          # ('fit.py', 'data.csv')
+```
+
+They are checked before the directory is claimed, so a typo does not leave an orphaned job directory behind. `Submission.inputs` records what was staged, because tether is the only thing that can tell inputs from results afterwards.
+
+`stdout()` and `stderr()` read what the job has written so far, including while it is still running, which is how partial output is followed. Both take a `Submission` or a bare job directory, so a job picked up in a later session can be read without one.
+
+```python
+srv.stdout(s)                    # or srv.stdout(s.directory)
+srv.get(s.directory, 'results/', recurse=True)
+```
+
 ## Decisions worth knowing
 
 **One connection, many channels.** SSH multiplexes: each command is a channel on an already-authenticated link, so 50 commands cost one authentication. The SFTP client is held open for the same reason — each one spawns a subsystem channel and an `sftp-server` process remotely.
@@ -356,7 +375,6 @@ which is caught internally.
 
 Environments are done; running things is not. Deliberately deferred:
 
-- file staging into the job directory, and fetching results back out
 - log streaming, and reattach-by-directory
 
 ## Tests

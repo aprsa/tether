@@ -665,3 +665,17 @@ def test_cancelling_does_not_merely_signal():
     called cancel must not use it. Graceful shutdown is asked for at submission
     instead, via `--signal=B:TERM@60`."""
     assert '--signal' not in cancel_command('682')
+
+
+@pytest.mark.parametrize('claimed', ['output', 'error'])
+def test_the_output_location_cannot_be_moved_out_from_under_stdout(claimed):
+    """A later `#SBATCH --output` wins, so this would send the job's output
+    somewhere `stdout()` does not look -- and reading nothing there is
+    indistinguishable from a job that has not started writing."""
+    with pytest.raises(tether.SlurmError, match='cannot be set through directives'):
+        batch_script('true', name='fit', directives={claimed: '/tmp/elsewhere'})
+
+
+def test_other_directives_are_still_passed_through():
+    got = batch_script('true', name='fit', directives={'gres': 'gpu:1'})
+    assert '#SBATCH --gres=gpu:1' in got
