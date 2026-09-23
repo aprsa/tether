@@ -635,6 +635,40 @@ class SlurmServer(Server):
         jobs = _slurm.parse_sacct(past.stdout)
         return jobs[0] if jobs else None
 
+    def cancel(self, jobid: str | int) -> None:
+        """Cancel a job. No return value; raises if there is nothing to cancel.
+
+        `scancel` reports nothing at all -- cancelling a running job, a job
+        that finished an hour ago, and a job id that never existed are
+        indistinguishable, all silent and all exit 0. So a typo would quietly
+        "succeed". Tether checks first instead, and the exceptions carry what
+        the return value otherwise would: silence means the job was running or
+        queued and has now been told to stop.
+
+        Deliberately not synchronous. `scancel` returns immediately while
+        the job moves through `COMPLETING` on its own schedule -- cleanup and
+        the epilog can take a while on a large job -- so waiting for a terminal
+        state would block for an interval nothing can predict. Ask `job()` when
+        you want to know where it got to.
+        """
+        found = self.job(jobid)
+
+        if found is None:
+            raise SlurmError(
+                f'no record of job {jobid}, so there is nothing to cancel. It '
+                f'may never have existed, or it finished long enough ago that '
+                f'Slurm has forgotten it'
+            )
+
+        if found.is_finished:
+            raise SlurmError(
+                f'job {jobid} has already finished ({found.state}, exit '
+                f'{found.exit_code}), so there is nothing to cancel'
+            )
+
+        self.run(_slurm.cancel_command(jobid), check=True)
+
+
     def submit(
         self,
         payload: str,

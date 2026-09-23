@@ -266,6 +266,10 @@ On a cluster with no accounting, a job that finished more than `MinJobAge` ago
 is lost from Slurm. The job directory still proves it ran, and
 its `stdout` is still there.
 
+`cancel()` doesn't return a value; it raises if there was nothing to cancel. That is the whole signal, because `scancel` gives none: cancelling a running job, one that finished an hour ago, and an id that never existed are all silent and all exit 0, so a typo would quietly succeed.
+
+It is also deliberately not synchronous. `scancel` returns immediately while the job moves through `COMPLETING` at its own pace. Ask `job()` to get the up-to-date status.
+
 ## Decisions worth knowing
 
 **One connection, many channels.** SSH multiplexes: each command is a channel on an already-authenticated link, so 50 commands cost one authentication. The SFTP client is held open for the same reason — each one spawns a subsystem channel and an `sftp-server` process remotely.
@@ -353,7 +357,7 @@ which is caught internally.
 Environments are done; running things is not. Deliberately deferred:
 
 - file staging into the job directory, and fetching results back out
-- `cancel()`, log streaming, reattach-by-directory
+- log streaming, and reattach-by-directory
 
 ## Tests
 

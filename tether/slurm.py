@@ -615,3 +615,14 @@ def parse_exit_code(raw: str) -> tuple[int | None, int | None]:
     """
     status, _, killed = raw.strip().partition(':')
     return _int(status), _int(killed)
+
+def cancel_command(jobid: str | int) -> str:
+    """Command asking Slurm to cancel one job.
+
+    No `--signal`: with it, `scancel` *signals* the job and leaves it running,
+    which is not what a method called cancel should do. A job that wants a
+    chance to clean up asks for it at submission -- `--signal=B:TERM@60` sends
+    TERM a minute before the time limit -- which the `directives` passthrough
+    already carries.
+    """
+    return f'scancel {shlex.quote(str(jobid))}'

@@ -11,6 +11,7 @@ import tether
 from tether.slurm import (
     SACCT_SPEC,
     batch_script,
+    cancel_command,
     check_name,
     claim_command,
     distill_state,
@@ -653,3 +654,14 @@ def test_accounting_is_asked_for_the_job_not_its_steps():
     and .extern."""
     assert ' -X ' in sacct_command('682')
     assert '--parsable2' in sacct_command('682')
+
+
+def test_cancelling_quotes_the_job_id():
+    assert shlex.split(cancel_command('1; rm -rf /'))[-1] == '1; rm -rf /'
+
+
+def test_cancelling_does_not_merely_signal():
+    """`scancel --signal=X` sends X and leaves the job running, so a method
+    called cancel must not use it. Graceful shutdown is asked for at submission
+    instead, via `--signal=B:TERM@60`."""
+    assert '--signal' not in cancel_command('682')

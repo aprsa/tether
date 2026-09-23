@@ -871,3 +871,40 @@ def test_the_environment_preamble_reaches_the_job(rig, tmp_path):
     finally:
         srv.run(f'rm -rf {s.directory}', check=True)
         srv.close()
+
+
+# -- cancelling ------------------------------------------------------------
+
+
+def test_a_running_job_can_be_cancelled(srv):
+    s = srv.submit('sleep 120', name='cancelme', time='00:05:00')
+    try:
+        for _ in range(60):
+            found = srv.job(s.jobid)
+            if found and found.is_running:
+                break
+            time.sleep(0.3)
+
+        assert srv.cancel(s.jobid) is None
+        done = wait_for(srv, s.jobid)
+        assert done.state == 'CANCELLED' and done.is_failed
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_cancelling_a_finished_job_is_an_error(srv):
+    """`scancel` would have been silent and exited 0. Without the check the
+    caller could not tell "cancelled" from "was already done"."""
+    s = srv.submit('true', name='alreadydone', time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        with pytest.raises(tether.SlurmError, match='already finished'):
+            srv.cancel(s.jobid)
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_cancelling_a_job_that_never_existed_is_an_error(srv):
+    """The case a typo produces, which `scancel` reports as success."""
+    with pytest.raises(tether.SlurmError, match='no record of job'):
+        srv.cancel('999999')
