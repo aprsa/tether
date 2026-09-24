@@ -289,6 +289,49 @@ srv.stdout(s)                    # or srv.stdout(s.directory)
 srv.get(s.directory, 'results/', recurse=True)
 ```
 
+### Picking a job up again
+
+Jobs outlive the session that started them, so `jobs()` finds them again without anything having been kept. The job directories store job ids, and tether can query Slurm for updates:
+
+```python
+for job in srv.jobs():
+    print(job.jobid, job.state, job.exit_code)
+    print(srv.stdout(job.workdir))
+```
+
+Any job absent from Slurm's database is *not* listed. tether considers Slurm the single source of truth.
+
+`status` keeps only the corresponding jobs. The following keys filter groups; any other word is matched against the state itself:
+
+```python
+srv.jobs(status='running')     # includes COMPLETING
+srv.jobs(status='failed')      # TIMEOUT, NODE_FAIL, OUT_OF_MEMORY, ...
+srv.jobs(status='canceled')    # CANCELLED, and nothing else
+srv.jobs(status='timeout')     # just that one state
+```
+
+### Removing remote job directories
+
+`prune()` removes all *finished* tether-controlled job directories (inputs, scripts, outputs, data, ...). Because it is destructive, `prune()` requires an explicit `force=True` argument; without it, it reports what *would* be removed. This protection is built in so that uncopied job directories are not inadvertently deleted. Fetch what you want first: `prune()` cannot know whether anything was downloaded.
+
+```python
+srv.prune()                # what would be deleted
+srv.prune(force=True)      # what was deleted
+```
+
+`prune()` returns directories it *actually* removed, i.e. the ones where `rm` succeeded. Pending or running jobs are skipped.
+
+For fetching-and-removing one job at a time, use `move()` instead of `get()`:
+
+```python
+srv.get(job.workdir, 'results/', recurse=True)     # cp
+srv.move(job.workdir, 'results/', recurse=True)    # mv
+```
+
+The remote path is removed only after the transfer is complete, so a failed download does not remove the source.
+
+Unlike `prune()`, `move()` is unguarded: it moves files and knows nothing about jobs, so pointed at a *running* job's directory it would take away the working directory the job is running in, thereby wreaking havoc.
+
 ## Decisions worth knowing
 
 **One connection, many channels.** SSH multiplexes: each command is a channel on an already-authenticated link, so 50 commands cost one authentication. The SFTP client is held open for the same reason — each one spawns a subsystem channel and an `sftp-server` process remotely.
@@ -370,12 +413,6 @@ require a `try`/`except`.
 
 `LinkError` rather than `ConnectionError` to avoid shadowing the builtin,
 which is caught internally.
-
-## Not yet implemented
-
-Environments are done; running things is not. Deliberately deferred:
-
-- log streaming, and reattach-by-directory
 
 ## Tests
 

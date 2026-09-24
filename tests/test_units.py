@@ -10,20 +10,27 @@ import pytest
 import tether
 from tether.slurm import (
     SACCT_SPEC,
+    batch_query,
     batch_script,
     cancel_command,
     check_name,
     claim_command,
     distill_state,
     job_directory,
+    jobs_query,
+    matches_status,
     parse_claim,
+    parse_directories,
     parse_duration,
     parse_exit_code,
+    parse_jobs,
+    parse_prune,
     parse_sacct,
     parse_scontrol,
     parse_sinfo,
     parse_squeue,
     parse_submit,
+    prune_command,
     sacct_command,
     scontrol_command,
     submit_command,
@@ -593,7 +600,8 @@ def test_a_cancelled_job_is_finished_despite_how_slurm_spells_it():
     running nor finished."""
     job = parse_sacct(sacct_row(state='CANCELLED by 1000'))[0]
     assert job.state == 'CANCELLED'
-    assert job.is_finished and job.is_failed
+    assert job.is_finished and job.is_canceled
+    assert not job.is_failed          # stopped on purpose, not broken
 
 
 def test_a_cancelled_job_exits_zero_and_is_still_a_failure():
@@ -601,7 +609,7 @@ def test_a_cancelled_job_exits_zero_and_is_still_a_failure():
     records the signal. `state` is the authority, not `exit_code`."""
     job = parse_sacct(sacct_row(state='CANCELLED by 1000', exit='0:0'))[0]
     assert job.exit_code == 0
-    assert job.is_failed
+    assert job.is_canceled and not job.is_failed
 
 
 def test_a_pipe_in_the_job_name_is_absorbed():
@@ -679,3 +687,112 @@ def test_the_output_location_cannot_be_moved_out_from_under_stdout(claimed):
 def test_other_directives_are_still_passed_through():
     got = batch_script('true', name='fit', directives={'gres': 'gpu:1'})
     assert '#SBATCH --gres=gpu:1' in got
+
+
+# -- finding jobs again ----------------------------------------------------
+
+
+def test_the_listing_yields_ids_to_ask_slurm_about():
+    """The directory is not returned: a `Job` carries it as `workdir`."""
+    assert parse_jobs('/jobs/fit.1\t626\n/jobs/fit.2\t627\n') == ['626', '627']
+
+
+def test_directories_are_paired_with_ids_for_cleaning():
+    got = parse_directories('/jobs/fit.1\t626\n/jobs/fit.2\t627\n')
+    assert got == {'626': '/jobs/fit.1', '627': '/jobs/fit.2'}
+
+
+@pytest.mark.parametrize('line', ['', 'rubbish\n', '/jobs/fit.1\n', '\t627\n', '/jobs/fit.1\t\n'])
+def test_incomplete_listing_lines_are_skipped(line):
+    assert parse_jobs(line) == []
+    assert parse_directories(line) == {}
+
+
+def test_a_base_with_nothing_in_it_is_not_a_failure():
+    """A `for` loop reports its last iteration's status."""
+    assert jobs_query('/jobs').rstrip().endswith('|| true')
+
+
+def test_only_directories_that_recorded_a_jobid_count():
+    """A submission that failed before sbatch answered leaves one behind."""
+    assert '[ -f "$dir/jobid" ]' in jobs_query('/jobs')
+
+
+def test_many_jobs_are_asked_about_in_one_call():
+    assert '--job=626,627,628' in batch_query(['626', '627', '628'])
+    assert '-j 626,627' in batch_query(['626', '627'], finished=True)
+
+
+def test_the_active_question_goes_to_squeue_and_the_rest_to_sacct():
+    """squeue lists only pending and running jobs and ignores ids it does not
+    know, which is exactly "which of these are still going"."""
+    assert batch_query(['1']).startswith('squeue')
+    assert batch_query(['1'], finished=True).startswith('sacct')
+
+
+def test_directories_are_removed_by_name_never_by_glob():
+    """A glob here would be one typo away from taking a sibling with it."""
+    got = prune_command(['/jobs/fit.1', '/jobs/my job'])
+    assert "for dir in /jobs/fit.1 '/jobs/my job'" in got
+    assert '*' not in got
+
+
+# -- filtering by status ---------------------------------------------------
+
+
+@pytest.mark.parametrize(('state', 'status'), [
+    ('RUNNING', 'running'), ('COMPLETED', 'completed'), ('PENDING', 'pending'),
+    ('TIMEOUT', 'timeout'), ('RUNNING', 'RUNNING'), ('running', 'Running'),
+])
+def test_a_status_that_matches(state, status):
+    assert matches_status(state, status)
+
+
+@pytest.mark.parametrize(('state', 'status'), [
+    ('COMPLETED', 'failed'), ('PENDING', 'running'), ('RUNNING', 'completed'),
+    ('FAILED', 'timeout'), ('CANCELLED', 'failed'),
+])
+def test_a_status_that_does_not(state, status):
+    assert not matches_status(state, status)
+
+
+def test_four_words_mean_the_grouping_not_the_single_state():
+    """`running` takes in COMPLETING, and `failed` covers everything that is
+    not COMPLETED -- the same questions `is_running` and `is_failed` answer."""
+    assert matches_status('COMPLETING', 'running')
+    assert matches_status('TIMEOUT', 'failed')
+    assert matches_status('OUT_OF_MEMORY', 'failed')
+    assert not matches_status('COMPLETED', 'failed')
+
+
+def test_any_other_word_is_the_state_itself():
+    """So a state tether never anticipated is still filterable."""
+    assert matches_status('NODE_FAIL', 'node_fail')
+    assert matches_status('PREEMPTED', 'preempted')
+
+
+def test_a_cancelled_job_is_not_a_failed_one():
+    """Stopped on purpose is not broken, and a caller told otherwise would act
+    on it -- a cancelled fit is not a fit that went wrong."""
+    assert matches_status('CANCELLED', 'canceled')
+    assert not matches_status('CANCELLED', 'failed')
+
+
+def test_slurm_spelling_works_too():
+    """The property is American; the state string is Slurm's to name."""
+    assert matches_status('CANCELLED', 'cancelled')
+
+
+def test_directories_are_removed_and_reported_one_at_a_time():
+    """`rm -rf a b c` cannot say which of the three it managed, and exits
+    non-zero on any failure -- turning a partial success into an exception
+    carrying no list."""
+    got = prune_command(['/jobs/a', '/jobs/b'])
+    assert 'for dir in /jobs/a /jobs/b' in got
+    assert 'rm -rf "$dir" && printf' in got
+    assert got.rstrip().endswith('|| true')
+
+
+def test_only_what_was_removed_comes_back():
+    assert parse_prune('/jobs/a\n\n/jobs/b\n') == ['/jobs/a', '/jobs/b']
+    assert parse_prune('') == []

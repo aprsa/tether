@@ -459,12 +459,12 @@ def test_a_failure_reaches_the_caller_with_its_exit_code(srv):
     assert sacct(srv, jobid) == [jobid, 'FAILED', '5:0']   # independent check
 
 
-def test_a_cancelled_job_is_failed_even_though_its_exit_code_is_zero(srv):
+def test_a_cancelled_job_is_canceled_even_though_its_exit_code_is_zero(srv):
     """The trap `-X` leaves behind, pinned so nobody "fixes" it later.
 
     The allocation row reports `ExitCode 0:0` for a killed job -- only the
     `.batch` step records the signal. A caller reading `exit_code == 0` as
-    success would be wrong; `state` and `is_failed` are the authority.
+    success would be wrong; `state` and `is_canceled` are the authority.
     """
     jobid = submit(srv, '#!/bin/bash\nsleep 60\n', name='killed')
     for _ in range(60):
@@ -887,7 +887,8 @@ def test_a_running_job_can_be_cancelled(srv):
 
         assert srv.cancel(s.jobid) is None
         done = wait_for(srv, s.jobid)
-        assert done.state == 'CANCELLED' and done.is_failed
+        assert done.state == 'CANCELLED' and done.is_canceled
+        assert not done.is_failed
     finally:
         srv.run(f'rm -rf {s.directory}', check=True)
 
@@ -964,3 +965,148 @@ def test_a_job_that_has_not_written_yet_reads_empty(srv):
 def test_a_removed_job_directory_is_an_error_not_an_empty_string(srv):
     with pytest.raises(tether.SlurmError, match='no job directory'):
         srv.stdout('/tmp/tether-no-such-job')
+
+
+# -- picking jobs up again -------------------------------------------------
+
+
+def test_jobs_are_found_again_with_nothing_kept(srv):
+    """The detached case: a later session has the connection and no objects."""
+    base = f'{srv.path("jobs")}-reattach'
+    first = srv.submit('echo alpha', name='alpha', time='00:02:00', jobs_base=base)
+    second = srv.submit('exit 3', name='beta', time='00:02:00', jobs_base=base)
+    try:
+        for sub in (first, second):
+            wait_for(srv, sub.jobid)
+
+        found = {job.jobid: job for job in srv.jobs(base)}
+        assert set(found) == {first.jobid, second.jobid}
+        assert found[second.jobid].exit_code == 3
+
+        # the directory comes back with the job, so output follows from it
+        assert found[first.jobid].workdir == first.directory
+        assert srv.stdout(found[first.jobid].workdir).strip() == 'alpha'
+    finally:
+        srv.run(f'rm -rf {base}', check=True)
+
+
+def test_a_base_nothing_was_submitted_to_is_empty_not_an_error(srv):
+    assert srv.jobs('/tmp/tether-no-jobs-here') == []
+    assert srv.prune('/tmp/tether-no-jobs-here') == []
+
+
+def test_a_directory_without_a_jobid_is_not_a_job(srv):
+    """What a submission that failed before sbatch answered leaves behind."""
+    base = f'{srv.path("jobs")}-partial'
+    try:
+        srv.run(f'mkdir -p {base}/halfdone.20260101-000000', check=True)
+        assert srv.jobs(base) == []
+    finally:
+        srv.run(f'rm -rf {base}', check=True)
+
+
+def test_pruning_removes_finished_jobs_and_spares_running_ones(srv):
+    """Deleting a running job's directory would take away the cwd it is
+    running in and the file Slurm is writing its output into."""
+    base = f'{srv.path("jobs")}-prune'
+    done = srv.submit('true', name='done', time='00:02:00', jobs_base=base)
+    busy = srv.submit('sleep 120', name='busy', time='00:05:00', jobs_base=base)
+    try:
+        wait_for(srv, done.jobid)
+        for _ in range(60):
+            found = srv.job(busy.jobid)
+            if found and found.is_running:
+                break
+            time.sleep(0.3)
+
+        removed = srv.prune(base, force=True)
+        assert removed == [done.directory]
+        assert srv.run(f'ls -1 {base}', check=True).stdout.split() == [
+            busy.directory.rsplit('/', 1)[-1]
+        ]
+    finally:
+        srv.run(f'scancel {busy.jobid} 2>/dev/null; sleep 2; rm -rf {base}', check=False)
+
+
+def test_jobs_can_be_filtered_by_status(srv):
+    base = f'{srv.path("jobs")}-status'
+    done = srv.submit('true', name='done', time='00:02:00', jobs_base=base)
+    busy = srv.submit('sleep 120', name='busy', time='00:05:00', jobs_base=base)
+    try:
+        wait_for(srv, done.jobid)
+        for _ in range(60):
+            found = srv.job(busy.jobid)
+            if found and found.is_running:
+                break
+            time.sleep(0.3)
+
+        assert [j.jobid for j in srv.jobs(base, status='completed')] == [done.jobid]
+        assert [j.jobid for j in srv.jobs(base, status='running')] == [busy.jobid]
+        assert srv.jobs(base, status='timeout') == []
+        assert len(srv.jobs(base)) == 2
+    finally:
+        srv.run(f'scancel {busy.jobid} 2>/dev/null; sleep 2; rm -rf {base}', check=False)
+
+
+def test_moving_takes_the_remote_copy_away(srv, tmp_path):
+    s = srv.submit('echo fetched', name='fetchme', time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        srv.move(s.directory, tmp_path / 'job', recurse=True)
+        assert (tmp_path / 'job' / 'stdout').read_text().strip() == 'fetched'
+        assert not srv.run(f'test -e {s.directory}').ok
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=False)
+
+
+def test_a_failed_download_leaves_the_remote_alone(srv):
+    """Removal happens after the transfer returns, not alongside it."""
+    s = srv.submit('true', name='keepme', time='00:02:00')
+    try:
+        wait_for(srv, s.jobid)
+        with pytest.raises(OSError):
+            srv.move(s.directory, '/proc/nonexistent/nope', recurse=True)
+        assert srv.run(f'test -e {s.directory}').ok
+    finally:
+        srv.run(f'rm -rf {s.directory}', check=True)
+
+
+def test_prune_reports_what_went_not_what_it_meant_to_remove(srv):
+    """The return value used to be built before the `rm` ran, so it claimed
+    success for directories that were still there afterwards."""
+    base = f'{srv.path("jobs")}-unremovable'
+    first = srv.submit('true', name='one', time='00:02:00', jobs_base=base)
+    second = srv.submit('true', name='two', time='00:02:00', jobs_base=base)
+    try:
+        for sub in (first, second):
+            wait_for(srv, sub.jobid)
+
+        # a read-only parent makes both genuinely unremovable
+        srv.run(f'chmod 500 {base}', check=True)
+        removed = srv.prune(base, force=True)
+        srv.run(f'chmod 700 {base}', check=True)
+
+        assert removed == []
+        assert len(srv.run(f'ls -1 {base}', check=True).stdout.split()) == 2
+    finally:
+        srv.run(f'chmod -R 700 {base} 2>/dev/null; rm -rf {base}', check=False)
+
+
+def test_pruning_removes_nothing_without_force(srv):
+    """The unflagged call reports what would go, the way `git clean` does --
+    so the flag is a decision rather than a reflex, and nobody loses a month
+    of results to a method they half-understood."""
+    base = f'{srv.path("jobs")}-dryrun'
+    s = srv.submit('true', name='safe', time='00:02:00', jobs_base=base)
+    try:
+        wait_for(srv, s.jobid)
+
+        would = srv.prune(base)
+        assert would == [s.directory]
+        assert srv.run(f'test -d {s.directory}').ok        # still there
+
+        went = srv.prune(base, force=True)
+        assert went == [s.directory]
+        assert not srv.run(f'test -d {s.directory}').ok
+    finally:
+        srv.run(f'rm -rf {base}', check=True)

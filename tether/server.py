@@ -506,8 +506,26 @@ class Server:
         *,
         recurse: bool = False,
     ) -> None:
-        """Download."""
+        """Copy remote files to local."""
         self._link.get(remote, local, recurse=recurse)
+
+    def move(
+        self,
+        remote: str,
+        local: str | os.PathLike[str],
+        *,
+        recurse: bool = False,
+    ) -> None:
+        """Move remote files to local.
+
+        The remote is deleted after the transfer returns, so a failed download
+        leaves it alone.
+
+        Unguarded on purpose: this moves files and knows nothing about jobs.
+        See `prune()` for guarded removal of finished job directories.
+        """
+        self.get(remote, local, recurse=recurse)
+        self.run(f'rm -rf {_shell.remote_path(remote)}', check=True)
 
     def ping(self) -> float:
         """Round-trip time in seconds."""
@@ -668,6 +686,96 @@ class SlurmServer(Server):
                 f'it has been removed'
             )
         return result.stdout
+
+    def jobs(
+        self,
+        jobs_base: str | None = None,
+        *,
+        status: str | None = None,
+    ) -> list[Job]:
+        """Every job tether submitted from here that Slurm still knows about.
+
+        The job directories say which ids to ask about, and Slurm
+        reports on their status. `Job.workdir` is the job's directory.
+
+        A job Slurm no longer registers is *not* listed. Slurm owns state; a
+        directory whose job has aged out of both slurmctld and the accounting
+        database has no state left to report, only files. Use `prune()` to remove
+        such directories.
+        """
+        ids = _slurm.parse_jobs(
+            self.run(
+                _slurm.jobs_query(jobs_base or self.path('jobs')), check=True
+            ).stdout
+        )
+        if not ids:
+            return []
+
+        active = {
+            job.jobid: job
+            for job in _slurm.parse_squeue(
+                self.run(_slurm.batch_query(ids)).stdout
+            )
+        }
+        past = {
+            job.jobid: job
+            for job in _slurm.parse_sacct(
+                self.run(_slurm.batch_query(ids, finished=True)).stdout
+            )
+        }
+
+        # squeue first where both answered: it carries the pending reason.
+        found = [active.get(jobid) or past.get(jobid) for jobid in ids]
+        return [
+            job for job in found
+            if job is not None
+            and (status is None or _slurm.matches_status(job.state, status))
+        ]
+
+    def prune(
+        self,
+        jobs_base: str | None = None,
+        *,
+        force: bool = False,
+    ) -> list[str]:
+        """Remove the directories of jobs that are no longer running.
+
+        **Dry-runs unless `force=True`.** Without it prune() reports what
+        *would* be removed. Every finished job is in scope, and there is no undo,
+        so use this carefully.
+
+            srv.prune()               # what would be removed
+            srv.prune(force=True)     # what was removed
+
+        With `force`, returns the directories that were actually removed --
+        each reports itself only after its own `rm` succeeded.
+        """
+        directories = _slurm.parse_directories(
+            self.run(
+                _slurm.jobs_query(jobs_base or self.path('jobs')), check=True
+            ).stdout
+        )
+        if not directories:
+            return []
+
+        # `squeue` lists only what is pending or running and ignores ids it
+        # does not recognise, so this is exactly the set to leave alone.
+        busy = {
+            job.jobid
+            for job in _slurm.parse_squeue(
+                self.run(_slurm.batch_query(directories)).stdout
+            )
+        }
+        doomed = [at for jobid, at in directories.items() if jobid not in busy]
+        if not doomed or not force:
+            return doomed
+
+        # What comes back is what went: each directory reports itself only
+        # after its own `rm` succeeded, so this is a fact rather than the list
+        # tether meant to remove.
+        return _slurm.parse_prune(
+            self.run(_slurm.prune_command(doomed), check=True).stdout
+        )
 
     def cancel(self, jobid: str | int) -> None:
         """Cancel a job. No return value; raises if there is nothing to cancel.

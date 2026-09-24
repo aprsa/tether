@@ -18,7 +18,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -65,7 +65,10 @@ FINISHED_STATES = frozenset({
     'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED',
     'BOOT_FAIL', 'DEADLINE', 'OUT_OF_MEMORY', 'REVOKED',
 })
-FAILED_STATES = FINISHED_STATES - {'COMPLETED'}
+CANCELLED_STATES = frozenset({
+    'CANCELLED'
+})
+FAILED_STATES = FINISHED_STATES - {'COMPLETED', 'CANCELLED'}
 
 
 def spec_format(spec: dict[str, str]) -> str:
@@ -152,6 +155,10 @@ class Job:
     @property
     def is_failed(self) -> bool:
         return self.state in FAILED_STATES
+
+    @property
+    def is_canceled(self) -> bool:
+        return self.state in CANCELLED_STATES
 
     def __str__(self) -> str:
         return f'{self.jobid} {self.state} {self.name!r} ({self.user})'
@@ -534,7 +541,7 @@ def sacct_command(jobid: str | int) -> str:
     The cost of `-X` is worth stating: a cancelled job's allocation row reports
     `ExitCode 0:0`, because only the `.batch` step records the signal that
     killed it. The *state* still says `CANCELLED`, so nothing is lost for a
-    caller who reads `is_failed` -- but one who reads `exit_code == 0` as
+    caller who reads `is_canceled` -- but one who reads `exit_code == 0` as
     success would be wrong.
     """
     fields = ','.join(SACCT_SPEC.values())
@@ -640,3 +647,112 @@ def cancel_command(jobid: str | int) -> str:
     already carries.
     """
     return f'scancel {shlex.quote(str(jobid))}'
+
+
+def jobs_query(base: str) -> str:
+    """Command listing the job directories under `base`, with their job ids.
+
+    The jobid is read from each directory rather than asked of
+    Slurm, which may well have forgotten the job entirely.
+
+    A directory without a `jobid` file is skipped -- a submission that failed
+    before `sbatch` answered leaves one, and it is not a job. The trailing
+    `|| true` is the usual guard: a `for` loop reports its last iteration's
+    status, and a base with nothing in it must not read as failure.
+    """
+    at = remote_path(base)
+    return '\n'.join((
+        f'for dir in {at}/*/; do',
+        '    [ -f "$dir/jobid" ] &&',
+        '        printf \'%s\\t%s\\n\' "${dir%/}" "$(cat "$dir/jobid")"',
+        'done 2>/dev/null || true',
+    ))
+
+
+def parse_jobs(stdout: str) -> list[str]:
+    """Job ids from `jobs_query()`, in the order the shell listed them.
+
+    The directory is not returned: a `Job` carries it already, as `workdir`.
+    The listing is the set of ids that Slurm knows (or knew) about.
+    """
+    found = []
+    for line in stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 2:
+            continue
+        directory, jobid = (part.strip() for part in parts)
+        if directory and jobid:
+            found.append(jobid)
+    return found
+
+
+def batch_query(jobids: Iterable[str], *, finished: bool = False) -> str:
+    """Command asking about many jobs at once.
+
+    `squeue` lists only what is pending or running and ignores ids it does not
+    recognize, which makes it exactly the question "which of these are still
+    active". `sacct` covers finished ones too, at the cost of needing an
+    accounting database and never filling in `reason`.
+
+    Both take a comma-separated list, so a hundred jobs cost one call.
+    """
+    wanted = ','.join(shlex.quote(str(jobid)) for jobid in jobids)
+    if finished:
+        fields = ','.join(SACCT_SPEC.values())
+        return f'sacct -n -X --parsable2 -o {fields} -j {wanted}'
+
+    fmt = shlex.quote(spec_format(SQUEUE_SPEC))
+    return f'squeue -h -a -o {fmt} --job={wanted}'
+
+
+def prune_command(directories: Iterable[str]) -> str:
+    """Command removing job directories, printing each one it actually removed.
+
+    Each is named in full rather than globbed.
+
+    Removed and reported per directory, so the caller is told what went rather
+    than what was attempted. A single `rm -rf a b c` cannot say which of the
+    three it managed, and exits non-zero on any failure -- turning a partial
+    success into an exception carrying no list at all.
+    """
+    targets = ' '.join(remote_path(d) for d in directories)
+    return '\n'.join((
+        f'for dir in {targets}; do',
+        '''    rm -rf "$dir" && printf '%s\\n' "$dir"''',
+        'done 2>/dev/null || true',
+    ))
+
+
+def parse_prune(stdout: str) -> list[str]:
+    """The directories that were removed, in the order they were removed."""
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+def parse_directories(stdout: str) -> dict[str, str]:
+    """`{jobid: directory}` from `jobs_query()`, for deciding what to remove."""
+    found = {}
+    for line in stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 2:
+            continue
+        directory, jobid = (part.strip() for part in parts)
+        if directory and jobid:
+            found[jobid] = directory
+    return found
+
+
+_STATUS_GROUPS = {
+    'pending': PENDING_STATES,
+    'running': RUNNING_STATES,
+    'finished': FINISHED_STATES,
+    'failed': FAILED_STATES,
+    'canceled': CANCELLED_STATES,
+}
+
+
+def matches_status(state: str, status: str) -> bool:
+    """Match `state` to `status`, case-insensitively, or pass through.
+    """
+    wanted = status.strip().upper()
+    group = _STATUS_GROUPS.get(status.strip().lower())
+    return state.upper() in group if group else state.upper() == wanted
