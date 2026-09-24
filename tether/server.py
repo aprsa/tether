@@ -10,7 +10,8 @@ import os
 import pathlib
 import posixpath
 import shlex
-from collections.abc import Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -810,6 +811,48 @@ class SlurmServer(Server):
 
         self.run(_slurm.cancel_command(jobid), check=True)
 
+    def wait(
+        self,
+        job: str | int | Submission | Job,
+        *,
+        poll_every: float = 60.,  # in seconds
+        on_poll: Callable[[Job], None] | None = None,
+    ) -> Job:
+        """Block until a job finishes, and report how it finished.
+
+        Takes a jobid and a `Submission` or a `Job`. This is the `fg` to
+        a detached submission.
+
+        Returns the finished `Job` whatever state it reached -- `COMPLETED`,
+        `FAILED`, `CANCELLED` -- since all three are answers. Read `state` to
+        tell them apart.
+
+        There is no timeout, because a job can legitimately sit queued for
+        days. Ctrl-C abandons the *wait*, not the job: it keeps running, and
+        `jobs()` finds it again.
+
+        `on_poll` is called with the current `Job` each time round, including
+        the last. Nothing is printed otherwise.
+        """
+        jobid = job.jobid if isinstance(job, (Submission, Job)) else str(job)
+
+        while True:
+            found = self.job(jobid)
+            if found is None:
+                raise SlurmError(
+                    f'job {jobid} disappeared while waiting for it. Slurm '
+                    f'forgets a finished job after MinJobAge unless accounting '
+                    f'is configured, so a poll_every longer than that can miss '
+                    f'the end of a job entirely'
+                )
+
+            if on_poll is not None:
+                on_poll(found)
+            if found.is_finished:
+                return found
+
+            time.sleep(poll_every)
+
     def submit(
         self,
         payload: str,
@@ -823,7 +866,10 @@ class SlurmServer(Server):
         directives: Mapping[str, str] | None = None,
         inputs: Iterable[str | os.PathLike[str]] = (),
         jobs_base: str | None = None,
-    ) -> Submission:
+        wait: bool = False,
+        poll_every: float | None = None,
+        on_poll: Callable[[Job], None] | None = None,
+    ) -> Submission | Job:
         """Submit `payload` as a batch job, and report what was sent.
 
         Everything about the job lands in one directory, `<jobs_base>/<name>.
@@ -848,7 +894,22 @@ class SlurmServer(Server):
         Per-job inputs only. A large file shared by many jobs should be `put()`
         somewhere stable once and referred to by absolute path, rather than
         copied per submission.
+
+        `wait` blocks until the job finishes and returns the resulting `Job`
+        instead of a `Submission`.
+
+        Without it, submission returns as soon as Slurm has accepted the job.
+        That is the default because a blocking call in a loop quietly
+        serialises work a cluster was bought to run at once, and because
+        `jobs()` makes a detached job easy to find again. `poll_every` and
+        `on_poll` apply to `wait()`.
         """
+        if not wait and (poll_every is not None or on_poll is not None):
+            raise ConfigError(
+                'poll_every and on_poll only mean something while waiting; '
+                'pass wait=True, or drop them'
+            )
+
         staged = [pathlib.Path(source) for source in inputs]
         missing = [str(source) for source in staged if not source.exists()]
         if missing:
@@ -897,7 +958,7 @@ class SlurmServer(Server):
         # tether knows this job existed once Slurm no longer does.
         self.run(f'printf %s {shlex.quote(jobid)} > {at}/{_slurm.JOBID}', check=True)
 
-        return Submission(
+        submission = Submission(
             jobid=jobid,
             directory=directory,
             name=name,
@@ -908,6 +969,15 @@ class SlurmServer(Server):
             memory=memory,
             directives=tuple((directives or {}).items()),
             inputs=tuple(source.name for source in staged),
+        )
+
+        if not wait:
+            return submission
+
+        return self.wait(
+            submission,
+            poll_every=60. if poll_every is None else poll_every,
+            on_poll=on_poll,
         )
 
 

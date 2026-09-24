@@ -1110,3 +1110,87 @@ def test_pruning_removes_nothing_without_force(srv):
         assert not srv.run(f'test -d {s.directory}').ok
     finally:
         srv.run(f'rm -rf {base}', check=True)
+
+
+# -- waiting ---------------------------------------------------------------
+
+
+def test_submitting_with_wait_returns_the_finished_job(srv):
+    """Sugar for `wait(submit(...))`, so it returns what the caller waited for
+    rather than a record of what was asked."""
+    s = srv.submit('sleep 2; exit 2', name='blocking', time='00:02:00',
+                   wait=True, poll_every=1)
+    try:
+        assert isinstance(s, tether.Job)
+        assert s.is_finished and s.exit_code == 2
+    finally:
+        srv.run(f'rm -rf {s.workdir}', check=True)
+
+
+def test_submitting_without_wait_returns_at_once(srv):
+    """The default, because a blocking call in a loop quietly serialises work
+    a cluster was bought to run at once."""
+    s = srv.submit('sleep 30', name='detached', time='00:02:00')
+    try:
+        assert isinstance(s, tether.Submission)
+    finally:
+        srv.run(f'scancel {s.jobid} 2>/dev/null; sleep 2; rm -rf {s.directory}',
+                check=False)
+
+
+def test_a_detached_job_can_be_waited_on_afterwards(srv):
+    """The `fg` case: submitted, walked away, came back to watch it."""
+    sub = srv.submit('sleep 2; echo later', name='fg', time='00:02:00')
+    try:
+        seen = []
+        done = srv.wait(sub, poll_every=1, on_poll=seen.append)
+        assert done.is_finished and done.jobid == sub.jobid
+        assert seen and seen[-1].is_finished      # the last poll sees the end
+    finally:
+        srv.run(f'rm -rf {sub.directory}', check=True)
+
+
+def test_waiting_accepts_a_job_from_the_listing(srv):
+    """What `jobs()` hands back, so a job found later needs no unwrapping."""
+    sub = srv.submit('true', name='fromlist', time='00:02:00')
+    try:
+        wait_for(srv, sub.jobid)
+        found = next(j for j in srv.jobs() if j.jobid == sub.jobid)
+        assert srv.wait(found, poll_every=1).is_finished
+    finally:
+        srv.run(f'rm -rf {sub.directory}', check=True)
+
+
+def test_waiting_on_something_already_finished_returns_at_once(srv):
+    sub = srv.submit('true', name='quick', time='00:02:00')
+    try:
+        wait_for(srv, sub.jobid)
+        start = time.monotonic()
+        assert srv.wait(sub, poll_every=30).is_finished
+        assert time.monotonic() - start < 10      # never slept
+    finally:
+        srv.run(f'rm -rf {sub.directory}', check=True)
+
+
+def test_a_cancelled_job_ends_the_wait_too(srv):
+    """CANCELLED is an answer, not a reason to keep waiting."""
+    sub = srv.submit('sleep 120', name='stopped', time='00:05:00')
+    try:
+        for _ in range(60):
+            found = srv.job(sub.jobid)
+            if found and found.is_running:
+                break
+            time.sleep(0.3)
+        srv.cancel(sub.jobid)
+        done = srv.wait(sub, poll_every=1)
+        assert done.is_canceled and not done.is_failed
+    finally:
+        srv.run(f'rm -rf {sub.directory}', check=True)
+
+
+@pytest.mark.parametrize('extra', [{'poll_every': 5}, {'on_poll': print}])
+def test_polling_arguments_without_wait_are_refused(srv, extra):
+    """Silently ignoring them would be the kind of no-op someone loses an
+    afternoon to."""
+    with pytest.raises(tether.ConfigError, match='only mean something while waiting'):
+        srv.submit('true', name='oops', **extra)

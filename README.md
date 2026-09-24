@@ -289,6 +289,29 @@ srv.stdout(s)                    # or srv.stdout(s.directory)
 srv.get(s.directory, 'results/', recurse=True)
 ```
 
+### Waiting for a job
+
+`submit()` returns as soon as Slurm accepts the job. `wait=True` blocks instead, and returns the finished `Job` rather than a `Submission` — it is sugar for `wait(submit(...))`:
+
+```python
+job = srv.submit('python fit.py', name='fit', wait=True)
+job.state, job.exit_code
+```
+
+`wait()` on its own does the same for a job that is already running. It takes a jobid, and `Submission` or a `Job`:
+
+```python
+sub = srv.submit('python fit.py', name='fit')     # asynchronous execution
+job = srv.wait(sub)                               # awaited execution
+job = srv.wait(srv.jobs(status='running')[0])     # pick the first from the list
+```
+
+Not waiting is the default because a blocking call inside a loop quietly serialises work a cluster was bought to run at once.
+
+This is polling, not notification: Slurm has nothing to push, so the loop is simply on tether's side of the wall. `poll_every` sets the interval in seconds (default 60), and `on_poll` is an optional callback called with the current `Job` at each poll. Passing either without `wait` raises an error.
+
+There is no timeout. Ctrl-C interrupts the `wait()`, not the job: it keeps running, and `jobs()` finds it again.
+
 ### Picking a job up again
 
 Jobs outlive the session that started them, so `jobs()` finds them again without anything having been kept. The job directories store job ids, and tether can query Slurm for updates:
